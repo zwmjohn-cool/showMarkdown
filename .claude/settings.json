@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/zwm/Desktop/llm-for-zotero/src/utils/**)",
+      "Bash(npm install *)"
+    ]
+  }
+}

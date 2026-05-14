@@ -1,0 +1,39 @@
+{
+  "name": "show-markdown",
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Create Zotero Markdown attachments for MinerU cache files",
+  "config": {
+    "addonName": "Show Markdown",
+    "addonID": "show-markdown@local",
+    "addonRef": "showmarkdown",
+    "addonInstance": "ShowMarkdown",
+    "prefsPrefix": "extensions.zotero.showmarkdown"
+  },
+  "author": "zwm",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zwm/show-markdown.git"
+  },
+  "homepage": "https://github.com/zwm/show-markdown#readme",
+  "license": "AGPL-3.0-or-later",
+  "scripts": {
+    "start": "zotero-plugin serve",
+    "build": "zotero-plugin build && npm run typecheck",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zotero-plugin-toolkit": "^5.1.0-beta.13"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "typescript": "^5.9.3",
+    "zotero-plugin-scaffold": "^0.8.2",
+    "zotero-types": "^4.1.0-beta.4"
+  },
+  "prettier": {
+    "printWidth": 80,
+    "tabWidth": 2,
+    "endOfLine": "lf"
+  }
+}
