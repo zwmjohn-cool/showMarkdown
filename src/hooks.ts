@@ -7,6 +7,11 @@ import {
   unregisterMineruMarkdownAttachmentSync,
   unregisterSelectionSync,
 } from "./modules/mineruMarkdownPanel";
+import {
+  registerPdfQuickLook,
+  unregisterAllPdfQuickLook,
+  unregisterPdfQuickLook,
+} from "./modules/pdfQuickLook";
 import { createZToolkit } from "./utils/ztoolkit";
 
 async function onStartup() {
@@ -30,15 +35,18 @@ async function onStartup() {
 async function onMainWindowLoad(win: _ZoteroTypes.MainWindow): Promise<void> {
   addon.data.ztoolkit = createZToolkit();
   registerSelectionSync(win);
+  registerPdfQuickLook(win);
   await syncSelectedItems(win);
 }
 
 async function onMainWindowUnload(win: Window): Promise<void> {
   unregisterSelectionSync(win);
+  unregisterPdfQuickLook(win);
 }
 
 function onShutdown(): void {
   unregisterAllSelectionSync();
+  unregisterAllPdfQuickLook();
   unregisterMineruMarkdownAttachmentSync();
   ztoolkit.unregisterAll();
   addon.data.alive = false;
