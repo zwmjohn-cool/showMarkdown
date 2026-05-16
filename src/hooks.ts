@@ -1,7 +1,9 @@
 import {
   registerMineruMarkdownAttachmentSync,
   registerSelectionSync,
+  syncAllItems,
   syncSelectedItems,
+  unregisterAllSelectionSync,
   unregisterMineruMarkdownAttachmentSync,
   unregisterSelectionSync,
 } from "./modules/mineruMarkdownPanel";
@@ -20,6 +22,8 @@ async function onStartup() {
     Zotero.getMainWindows().map((win) => onMainWindowLoad(win)),
   );
 
+  void syncAllItems();
+
   addon.data.initialized = true;
 }
 
@@ -34,6 +38,7 @@ async function onMainWindowUnload(win: Window): Promise<void> {
 }
 
 function onShutdown(): void {
+  unregisterAllSelectionSync();
   unregisterMineruMarkdownAttachmentSync();
   ztoolkit.unregisterAll();
   addon.data.alive = false;
