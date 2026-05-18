@@ -3,4 +3,5 @@
 /* eslint-disable */
 // @ts-nocheck
 export type FluentMessageId =
-  | 'show-markdown-addon-name';
+  | 'show-markdown-addon-name'
+  | 'show-markdown-mineru-tools';

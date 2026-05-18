@@ -12,6 +12,10 @@ import {
   unregisterAllPdfQuickLook,
   unregisterPdfQuickLook,
 } from "./modules/pdfQuickLook";
+import {
+  registerMineruReaderTools,
+  unregisterMineruReaderTools,
+} from "./modules/mineruReaderTools";
 import { createZToolkit } from "./utils/ztoolkit";
 
 async function onStartup() {
@@ -22,6 +26,7 @@ async function onStartup() {
   ]);
 
   registerMineruMarkdownAttachmentSync();
+  registerMineruReaderTools();
 
   await Promise.all(
     Zotero.getMainWindows().map((win) => onMainWindowLoad(win)),
@@ -47,6 +52,7 @@ async function onMainWindowUnload(win: Window): Promise<void> {
 function onShutdown(): void {
   unregisterAllSelectionSync();
   unregisterAllPdfQuickLook();
+  unregisterMineruReaderTools();
   unregisterMineruMarkdownAttachmentSync();
   ztoolkit.unregisterAll();
   addon.data.alive = false;

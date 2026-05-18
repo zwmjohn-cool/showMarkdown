@@ -91,6 +91,10 @@ export function getMineruItemDir(attachmentId: number): string {
   return joinLocalPath(getMineruCacheDir(), String(attachmentId));
 }
 
+export function getMineruLayoutPath(attachmentId: number): string {
+  return joinLocalPath(getMineruItemDir(attachmentId), "layout.json");
+}
+
 function getMarkdownCandidates(
   attachmentId: number,
   itemTitle: string,
@@ -167,6 +171,12 @@ async function readFileBytes(path: string): Promise<Uint8Array | null> {
   return null;
 }
 
+export async function readCachedTextFile(path: string): Promise<string | null> {
+  const bytes = await readFileBytes(path);
+  if (!bytes) return null;
+  return new TextDecoder("utf-8").decode(bytes);
+}
+
 async function writeFileBytes(path: string, bytes: Uint8Array): Promise<void> {
   const io = getIOUtils();
   if (io?.write) {
@@ -187,6 +197,28 @@ export async function findCachedMineruMarkdownPath(
   for (const path of getMarkdownCandidates(pdfAttachmentId, itemTitle)) {
     if (await pathExists(path)) return path;
   }
+  return null;
+}
+
+export async function findCachedMineruLayoutPath(
+  pdfAttachmentId: number,
+  itemTitle: string,
+): Promise<string | null> {
+  const candidates = [
+    getMineruLayoutPath(pdfAttachmentId),
+    ...getMarkdownCandidates(pdfAttachmentId, itemTitle).map((path) =>
+      joinLocalPath(getDirectoryPath(path), "layout.json"),
+    ),
+  ];
+  const seen = new Set<string>();
+
+  for (const path of candidates) {
+    const normalizedPath = normalizePath(path);
+    if (seen.has(normalizedPath)) continue;
+    seen.add(normalizedPath);
+    if (await pathExists(path)) return path;
+  }
+
   return null;
 }
 
@@ -217,6 +249,13 @@ function getNamedMarkdownPath(attachmentId: number, itemTitle: string): string {
     getMineruItemDir(attachmentId),
     `${sanitizeFileName(itemTitle)}.md`,
   );
+}
+
+function getDirectoryPath(path: string): string {
+  const normalizedPath = normalizePath(path);
+  const separatorIndex = normalizedPath.lastIndexOf("/");
+  if (separatorIndex <= 0) return "";
+  return normalizedPath.slice(0, separatorIndex);
 }
 
 function sanitizeFileName(value: string): string {
