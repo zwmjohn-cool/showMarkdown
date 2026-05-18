@@ -190,6 +190,14 @@ async function writeFileBytes(path: string, bytes: Uint8Array): Promise<void> {
   }
 }
 
+export async function writeCachedTextFile(
+  path: string,
+  text: string,
+): Promise<void> {
+  await ensureDir(getDirectoryPath(path));
+  await writeFileBytes(path, new TextEncoder().encode(text));
+}
+
 export async function findCachedMineruMarkdownPath(
   pdfAttachmentId: number,
   itemTitle: string,

@@ -2,14 +2,39 @@ import { config } from "../../../package.json";
 import {
   findCachedMineruLayoutPath,
   readCachedTextFile,
+  writeCachedTextFile,
 } from "../mineruMarkdownPanel/cache";
 
 const PANE_ID = "show-markdown-mineru-tools";
 const BBOX_LAYER_CLASS = "show-markdown-bbox-layer";
 const BBOX_CLASS = "show-markdown-bbox";
+const BBOX_SCROLL_CLASS = "show-markdown-bbox-scroll";
+const BBOX_TEXT_CLASS = "show-markdown-bbox-text";
 const PANE_STYLE_ID = "show-markdown-mineru-tools-style";
 const PDF_STYLE_ID = "show-markdown-bbox-style";
+const PDF_STYLE_VERSION = "2026-05-19-hover-scroll-v3";
 const ICON_URI = `chrome://${config.addonRef}/content/icons/icon-20.png`;
+const DEFAULT_TRANSLATION_BASE_URL = "http://127.0.0.1:1234";
+const DEFAULT_TRANSLATION_MODEL = "qwen/qwen3.6-27b";
+const DEFAULT_TRANSLATION_CONCURRENCY = "1";
+const MAX_TRANSLATION_CONCURRENCY = 8;
+const TRANSLATION_BATCH_SIZE = 1;
+const TRANSLATION_CACHE_FILE_NAME = "show-markdown-translations.json";
+const DEFAULT_TRANSLATED_BOX_COLOR = "#ffffff";
+const DEFAULT_TRANSLATED_BOX_BORDER_COLOR = "#f4d35e";
+const DEFAULT_UNTRANSLATED_BOX_COLOR = "#ffc107";
+const DEFAULT_TRANSLATION_TEXT_COLOR = "#000000";
+const DEFAULT_TRANSLATION_FONT_SIZE = "9";
+const PREF_TRANSLATION_BASE_URL = `${config.prefsPrefix}.translate.baseURL`;
+const PREF_TRANSLATION_MODEL = `${config.prefsPrefix}.translate.model`;
+const PREF_TRANSLATION_PAGES = `${config.prefsPrefix}.translate.pages`;
+const PREF_TRANSLATION_SKIP_PAGES = `${config.prefsPrefix}.translate.skipPages`;
+const PREF_TRANSLATION_CONCURRENCY = `${config.prefsPrefix}.translate.concurrency`;
+const PREF_TRANSLATED_BOX_COLOR = `${config.prefsPrefix}.display.translatedBoxColor`;
+const PREF_TRANSLATED_BOX_BORDER_COLOR = `${config.prefsPrefix}.display.translatedBoxBorderColor`;
+const PREF_UNTRANSLATED_BOX_COLOR = `${config.prefsPrefix}.display.untranslatedBoxColor`;
+const PREF_TRANSLATION_TEXT_COLOR = `${config.prefsPrefix}.display.textColor`;
+const PREF_TRANSLATION_FONT_SIZE = `${config.prefsPrefix}.display.fontSize`;
 
 type SectionProps = _ZoteroTypes.ItemPaneManagerSection.SectionHookArgs;
 
@@ -65,6 +90,7 @@ type PdfPageViewLike = {
 
 type MineruLayout = {
   pages: Map<number, MineruPageLayout>;
+  translationCachePath?: string;
 };
 
 type MineruPageLayout = {
@@ -74,18 +100,62 @@ type MineruPageLayout = {
 };
 
 type MineruBox = {
+  pageIndex: number;
   bbox: [number, number, number, number];
   label?: string;
+  text?: string;
+  translation?: string;
 };
 
+type TranslationCacheEntry = {
+  bbox?: [number, number, number, number];
+  label?: string;
+  pageIndex?: number;
+  text?: string;
+  translation?: string;
+  updatedAt?: string;
+};
+
+type TranslationAbortSignal = {
+  aborted: boolean;
+};
+
+type TranslationAbortController = {
+  signal: TranslationAbortSignal;
+  abort: () => void;
+};
+
+type AbortControllerConstructor = new () => AbortController;
+
 type ReaderOverlayState = {
+  displayConfig: DisplayConfig;
   layout: MineruLayout;
   cleanupCallbacks: Array<() => void>;
   renderTimer: ReturnType<typeof globalThis.setTimeout> | null;
+  translationAbortController?: TranslationAbortController;
+  translationRunId?: number;
+};
+
+type TranslationConfig = {
+  baseURL: string;
+  model: string;
+  pages: string;
+  skipPages: string;
+  concurrency: string;
+};
+
+type DisplayConfig = {
+  translatedBoxColor: string;
+  translatedBoxBorderColor: string;
+  untranslatedBoxColor: string;
+  textColor: string;
+  fontSize: string;
 };
 
 let paneRegistrationKey: string | null = null;
+let translationRunCounter = 0;
 const readerOverlayStates = new Map<string, ReaderOverlayState>();
+const guardedSelectionDocuments = new WeakSet<Document>();
 
 export function registerMineruReaderTools() {
   if (paneRegistrationKey) return;
@@ -133,26 +203,130 @@ function renderSection(props: SectionProps) {
 
   const container = doc.createElement("div");
   container.className = "show-markdown-mineru-menu";
+  const translationConfig = getTranslationConfig();
+  const displayConfig = getDisplayConfig();
 
   const toggleButton = doc.createElement("button");
   toggleButton.type = "button";
   toggleButton.className = "show-markdown-mineru-button";
   toggleButton.textContent = "Toggle";
 
+  const baseURLControl = createLabeledInput(
+    doc,
+    "URL",
+    translationConfig.baseURL,
+    DEFAULT_TRANSLATION_BASE_URL,
+  );
+  const modelControl = createLabeledInput(
+    doc,
+    "Model",
+    translationConfig.model,
+    DEFAULT_TRANSLATION_MODEL,
+  );
+  const pagesControl = createLabeledInput(
+    doc,
+    "Pages",
+    translationConfig.pages,
+    "1-3,5",
+  );
+  const skipPagesControl = createLabeledInput(
+    doc,
+    "Skip",
+    translationConfig.skipPages,
+    "2,4-6",
+  );
+  const concurrencyControl = createLabeledInput(
+    doc,
+    "Parallel",
+    translationConfig.concurrency,
+    DEFAULT_TRANSLATION_CONCURRENCY,
+  );
+  concurrencyControl.input.type = "number";
+  concurrencyControl.input.min = "1";
+  concurrencyControl.input.max = String(MAX_TRANSLATION_CONCURRENCY);
+  concurrencyControl.input.step = "1";
+  const translatedBoxColorControl = createLabeledInput(
+    doc,
+    "Text Box",
+    displayConfig.translatedBoxColor,
+    DEFAULT_TRANSLATED_BOX_COLOR,
+  );
+  translatedBoxColorControl.input.type = "color";
+  const translatedBoxBorderColorControl = createLabeledInput(
+    doc,
+    "Text Border",
+    displayConfig.translatedBoxBorderColor,
+    DEFAULT_TRANSLATED_BOX_BORDER_COLOR,
+  );
+  translatedBoxBorderColorControl.input.type = "color";
+  const untranslatedBoxColorControl = createLabeledInput(
+    doc,
+    "Empty Box",
+    displayConfig.untranslatedBoxColor,
+    DEFAULT_UNTRANSLATED_BOX_COLOR,
+  );
+  untranslatedBoxColorControl.input.type = "color";
+  const textColorControl = createLabeledInput(
+    doc,
+    "Font Color",
+    displayConfig.textColor,
+    DEFAULT_TRANSLATION_TEXT_COLOR,
+  );
+  textColorControl.input.type = "color";
+  const fontSizeControl = createLabeledInput(
+    doc,
+    "Font Size",
+    displayConfig.fontSize,
+    DEFAULT_TRANSLATION_FONT_SIZE,
+  );
+  fontSizeControl.input.type = "number";
+  fontSizeControl.input.min = "6";
+  fontSizeControl.input.max = "32";
+  fontSizeControl.input.step = "1";
+
   const translateButton = doc.createElement("button");
   translateButton.type = "button";
   translateButton.className = "show-markdown-mineru-button";
   translateButton.textContent = "Translate";
-  translateButton.disabled = true;
+
+  const stopButton = doc.createElement("button");
+  stopButton.type = "button";
+  stopButton.className = "show-markdown-mineru-button";
+  stopButton.textContent = "Stop";
+  stopButton.disabled = true;
 
   const status = doc.createElement("div");
   status.className = "show-markdown-mineru-status";
 
-  const refreshButtonState = () => {
+  const refreshButtonState = (syncStatus = false) => {
     const reader = findOpenPdfReaderForItem(item);
     const isVisible = reader ? isBoundingBoxesEnabled(reader) : false;
+    const state = reader ? readerOverlayStates.get(getReaderKey(reader)) : null;
+    const isTranslating = Boolean(state?.translationAbortController);
     toggleButton.classList.toggle("is-active", isVisible);
-    status.textContent = isVisible ? "Bounding boxes visible" : "";
+    stopButton.disabled = !isTranslating;
+    if (syncStatus) status.textContent = isVisible ? "Bounding boxes visible" : "";
+  };
+
+  const readDisplayConfig = (): DisplayConfig => ({
+    translatedBoxColor: translatedBoxColorControl.input.value,
+    translatedBoxBorderColor: translatedBoxBorderColorControl.input.value,
+    untranslatedBoxColor: untranslatedBoxColorControl.input.value,
+    textColor: textColorControl.input.value,
+    fontSize: fontSizeControl.input.value,
+  });
+
+  const applyDisplayConfig = (syncInputs = true) => {
+    const config = saveDisplayConfig(readDisplayConfig());
+    if (syncInputs) {
+      translatedBoxColorControl.input.value = config.translatedBoxColor;
+      translatedBoxBorderColorControl.input.value =
+        config.translatedBoxBorderColor;
+      untranslatedBoxColorControl.input.value = config.untranslatedBoxColor;
+      textColorControl.input.value = config.textColor;
+      fontSizeControl.input.value = config.fontSize;
+    }
+    updateActiveDisplayConfig(item, config);
   };
 
   toggleButton.addEventListener("click", async () => {
@@ -163,13 +337,78 @@ function renderSection(props: SectionProps) {
       status.textContent = result.message;
     } finally {
       toggleButton.disabled = false;
+      refreshButtonState(true);
+    }
+  });
+
+  translateButton.addEventListener("click", async () => {
+    const config: TranslationConfig = {
+      baseURL: baseURLControl.input.value,
+      model: modelControl.input.value,
+      pages: pagesControl.input.value,
+      skipPages: skipPagesControl.input.value,
+      concurrency: concurrencyControl.input.value,
+    };
+    saveTranslationConfig(config);
+    applyDisplayConfig();
+
+    toggleButton.disabled = true;
+    translateButton.disabled = true;
+    stopButton.disabled = false;
+    status.textContent = "Preparing translation...";
+    try {
+      const result = await translateBoundingBoxes(item, config, (message) => {
+        status.textContent = message;
+        refreshButtonState();
+      });
+      status.textContent = result.message;
+    } catch (err) {
+      ztoolkit.log("Show Markdown: translation failed", err);
+      status.textContent =
+        err instanceof Error ? err.message : "Translation failed.";
+    } finally {
+      toggleButton.disabled = false;
+      translateButton.disabled = false;
+      stopButton.disabled = true;
       refreshButtonState();
     }
   });
 
-  container.append(toggleButton, translateButton, status);
+  stopButton.addEventListener("click", () => {
+    const result = stopTranslation(item);
+    status.textContent = result.message;
+    refreshButtonState();
+  });
+
+  for (const control of [
+    translatedBoxColorControl,
+    translatedBoxBorderColorControl,
+    untranslatedBoxColorControl,
+    textColorControl,
+    fontSizeControl,
+  ]) {
+    control.input.addEventListener("input", () => applyDisplayConfig(false));
+    control.input.addEventListener("change", () => applyDisplayConfig(true));
+  }
+
+  container.append(
+    toggleButton,
+    baseURLControl.wrapper,
+    modelControl.wrapper,
+    pagesControl.wrapper,
+    skipPagesControl.wrapper,
+    concurrencyControl.wrapper,
+    translatedBoxColorControl.wrapper,
+    translatedBoxBorderColorControl.wrapper,
+    untranslatedBoxColorControl.wrapper,
+    textColorControl.wrapper,
+    fontSizeControl.wrapper,
+    translateButton,
+    stopButton,
+    status,
+  );
   body.append(container);
-  refreshButtonState();
+  refreshButtonState(true);
 }
 
 function updateSectionAvailability(props: SectionProps) {
@@ -192,18 +431,335 @@ async function toggleBoundingBoxes(
     return { message: "Bounding boxes hidden" };
   }
 
+  const layoutResult = await loadMineruLayout(pdfAttachment);
+  if (!layoutResult.layout) return { message: layoutResult.message };
+
+  await enableBoundingBoxes(targetReader, layoutResult.layout);
+  return { message: "Bounding boxes visible" };
+}
+
+async function translateBoundingBoxes(
+  item: Zotero.Item,
+  config: TranslationConfig,
+  onProgress: (message: string) => void,
+): Promise<{ message: string }> {
+  const readerFromItem = findOpenPdfReaderForItem(item);
+  const reader = readerFromItem || getActivePdfReader();
+  const pdfAttachment = resolvePdfAttachment(item, reader);
+  if (!pdfAttachment) return { message: "Open a PDF reader first." };
+
+  const targetReader = reader || findOpenPdfReaderForItem(pdfAttachment);
+  if (!targetReader) return { message: "Open this PDF in Zotero reader first." };
+
+  let state = readerOverlayStates.get(getReaderKey(targetReader));
+  if (!state) {
+    const layoutResult = await loadMineruLayout(pdfAttachment);
+    if (!layoutResult.layout) return { message: layoutResult.message };
+    state = await enableBoundingBoxes(targetReader, layoutResult.layout);
+  }
+
+  const selectedPageIndexes = getSelectedPageIndexes(state.layout, config);
+  const candidateBoxes = getTranslatableBoxes(state.layout, selectedPageIndexes);
+  if (!candidateBoxes.length) {
+    return { message: "No translatable text boxes in the selected pages." };
+  }
+  const boxes = candidateBoxes.filter((box) => !normalizeText(box.translation || ""));
+  const cachedCount = candidateBoxes.length - boxes.length;
+  if (!boxes.length) {
+    scheduleRender(targetReader, state);
+    return {
+      message: `All ${candidateBoxes.length} selected boxes already translated.`,
+    };
+  }
+
+  const runId = ++translationRunCounter;
+  const abortController = createTranslationAbortController(targetReader);
+  state.translationRunId = runId;
+  state.translationAbortController = abortController;
+  const endpoint = getChatCompletionsEndpoint(config.baseURL);
+  const batches = createTranslationBatches(boxes);
+  const concurrency = Math.min(
+    getTranslationConcurrency(config),
+    batches.length,
+  );
+  let nextBatchIndex = 0;
+  let completedCount = 0;
+  const progressSuffix = `${concurrency} parallel${
+    cachedCount ? `, ${cachedCount} cached` : ""
+  }`;
+  let savePromise: Promise<unknown> = Promise.resolve();
+  const queueSave = () => {
+    savePromise = savePromise.then(() => saveTranslationCache(state.layout));
+    return savePromise;
+  };
+  onProgress(`Translating 0/${boxes.length} (${progressSuffix})...`);
+
+  try {
+    const translateWorker = async () => {
+      while (true) {
+        if (
+          state.translationRunId !== runId ||
+          abortController.signal.aborted
+        ) {
+          return;
+        }
+
+        const batchIndex = nextBatchIndex;
+        nextBatchIndex += 1;
+        const batch = batches[batchIndex];
+        if (!batch) return;
+
+        const translations = await translateBatchWithFallback(
+          endpoint,
+          config.model,
+          batch.map((box) => box.text || ""),
+          abortController.signal,
+        );
+        if (
+          state.translationRunId !== runId ||
+          abortController.signal.aborted
+        ) {
+          return;
+        }
+
+        batch.forEach((box, index) => {
+          box.translation = translations[index] || "";
+        });
+        completedCount += batch.length;
+        await queueSave();
+
+        scheduleRender(targetReader, state);
+        onProgress(
+          `Translating ${Math.min(completedCount, boxes.length)}/${boxes.length} (${progressSuffix})...`,
+        );
+      }
+    };
+
+    await Promise.all(
+      Array.from({ length: concurrency }, () => translateWorker()),
+    );
+
+    if (state.translationRunId !== runId || abortController.signal.aborted) {
+      return { message: "Translation stopped." };
+    }
+
+    scheduleRender(targetReader, state);
+    await savePromise;
+    return {
+      message: `Translated ${boxes.length} bounding boxes${
+        cachedCount ? `; reused ${cachedCount} cached.` : "."
+      }`,
+    };
+  } catch (err) {
+    if (abortController.signal.aborted || isAbortError(err)) {
+      return { message: "Translation stopped." };
+    }
+    abortController.abort();
+    throw err;
+  } finally {
+    if (state.translationRunId === runId) {
+      state.translationAbortController = undefined;
+    }
+  }
+}
+
+function stopTranslation(item: Zotero.Item): { message: string } {
+  const reader = findOpenPdfReaderForItem(item) || getActivePdfReader();
+  if (!reader) return { message: "No open PDF reader." };
+
+  const state = readerOverlayStates.get(getReaderKey(reader));
+  if (!state?.translationAbortController) {
+    return { message: "No active translation." };
+  }
+
+  state.translationRunId = ++translationRunCounter;
+  state.translationAbortController.abort();
+  state.translationAbortController = undefined;
+  return { message: "Translation stopped." };
+}
+
+function updateActiveDisplayConfig(item: Zotero.Item, config: DisplayConfig) {
+  const reader = findOpenPdfReaderForItem(item) || getActivePdfReader();
+  if (!reader) return;
+
+  const state = readerOverlayStates.get(getReaderKey(reader));
+  if (!state) return;
+
+  state.displayConfig = config;
+  scheduleRender(reader, state);
+}
+
+function createTranslationAbortController(
+  reader: PrivatePdfReader,
+): TranslationAbortController {
+  const AbortControllerCtor = getAbortControllerConstructor(reader);
+  if (AbortControllerCtor) return new AbortControllerCtor();
+
+  const signal = { aborted: false };
+  return {
+    signal,
+    abort: () => {
+      signal.aborted = true;
+    },
+  };
+}
+
+function getAbortControllerConstructor(
+  reader: PrivatePdfReader,
+): AbortControllerConstructor | null {
+  const globalConstructor = (globalThis as unknown as {
+    AbortController?: AbortControllerConstructor;
+  }).AbortController;
+  if (typeof globalConstructor === "function") return globalConstructor;
+
+  const mainWindowConstructor = (Zotero.getMainWindow?.() as unknown as
+    | { AbortController?: AbortControllerConstructor }
+    | undefined)?.AbortController;
+  if (typeof mainWindowConstructor === "function") {
+    return mainWindowConstructor;
+  }
+
+  for (const view of getReaderPdfViews(reader)) {
+    const viewConstructor = (view._iframeWindow as unknown as
+      | { AbortController?: AbortControllerConstructor }
+      | undefined)?.AbortController;
+    if (typeof viewConstructor === "function") return viewConstructor;
+  }
+
+  return null;
+}
+
+async function applyTranslationCache(layout: MineruLayout): Promise<number> {
+  if (!layout.translationCachePath) return 0;
+
+  const cacheText = await readCachedTextFile(layout.translationCachePath);
+  if (!cacheText) return 0;
+
+  let rawCache: unknown;
+  try {
+    rawCache = JSON.parse(cacheText);
+  } catch (err) {
+    ztoolkit.log("Show Markdown: failed to parse translation cache", err);
+    return 0;
+  }
+
+  const entries = getTranslationCacheEntries(rawCache);
+  if (!entries) return 0;
+
+  let count = 0;
+  for (const page of layout.pages.values()) {
+    for (const box of page.boxes) {
+      const translation = readCachedTranslation(entries[getBoxCacheKey(box)], box);
+      if (!translation) continue;
+      box.translation = translation;
+      count += 1;
+    }
+  }
+
+  return count;
+}
+
+async function saveTranslationCache(layout: MineruLayout): Promise<number> {
+  if (!layout.translationCachePath) return 0;
+
+  const translations: Record<string, TranslationCacheEntry> = {};
+  let count = 0;
+  const updatedAt = new Date().toISOString();
+  for (const page of layout.pages.values()) {
+    for (const box of page.boxes) {
+      const translation = normalizeText(box.translation || "");
+      if (!translation) continue;
+
+      translations[getBoxCacheKey(box)] = {
+        bbox: box.bbox,
+        label: box.label,
+        pageIndex: box.pageIndex,
+        text: normalizeText(box.text || ""),
+        translation,
+        updatedAt,
+      };
+      count += 1;
+    }
+  }
+
+  await writeCachedTextFile(
+    layout.translationCachePath,
+    JSON.stringify({ version: 1, translations }, null, 2),
+  );
+  return count;
+}
+
+function getTranslationCacheEntries(
+  rawCache: unknown,
+): Record<string, unknown> | null {
+  if (!isPlainObject(rawCache)) return null;
+
+  const translations = rawCache.translations;
+  if (isPlainObject(translations)) return translations;
+
+  return rawCache;
+}
+
+function readCachedTranslation(
+  entry: unknown,
+  box: MineruBox,
+): string | undefined {
+  if (typeof entry === "string") return normalizeText(entry) || undefined;
+  if (!isPlainObject(entry)) return undefined;
+
+  const translation =
+    typeof entry.translation === "string"
+      ? normalizeText(entry.translation)
+      : "";
+  if (!translation) return undefined;
+
+  const cachedText =
+    typeof entry.text === "string" ? normalizeText(entry.text) : "";
+  const boxText = normalizeText(box.text || "");
+  if (cachedText && boxText && cachedText !== boxText) return undefined;
+
+  return translation;
+}
+
+function getTranslationCachePath(layoutPath: string): string {
+  const directory = getDirectoryPath(layoutPath);
+  return directory ? `${directory}/${TRANSLATION_CACHE_FILE_NAME}` : "";
+}
+
+function getDirectoryPath(path: string): string {
+  const normalizedPath = path.replace(/\\/g, "/").replace(/\/+/g, "/");
+  const separatorIndex = normalizedPath.lastIndexOf("/");
+  if (separatorIndex <= 0) return "";
+  return normalizedPath.slice(0, separatorIndex);
+}
+
+function getBoxCacheKey(box: MineruBox): string {
+  return `${box.pageIndex}:${box.bbox.map(formatBboxNumber).join(",")}`;
+}
+
+function formatBboxNumber(value: number): string {
+  if (Number.isInteger(value)) return String(value);
+  return String(Number(value.toFixed(3)));
+}
+
+async function loadMineruLayout(
+  pdfAttachment: Zotero.Item,
+): Promise<{ layout: MineruLayout | null; message: string }> {
   const parentTitle = getParentItemTitle(pdfAttachment);
   const layoutPath = await findCachedMineruLayoutPath(
     pdfAttachment.id,
     parentTitle,
   );
   if (!layoutPath) {
-    return { message: "layout.json not found in the MinerU result folder." };
+    return {
+      layout: null,
+      message: "layout.json not found in the MinerU result folder.",
+    };
   }
 
   const layoutText = await readCachedTextFile(layoutPath);
   if (!layoutText) {
-    return { message: "Cannot read layout.json." };
+    return { layout: null, message: "Cannot read layout.json." };
   }
 
   let rawLayout: unknown;
@@ -211,22 +767,28 @@ async function toggleBoundingBoxes(
     rawLayout = JSON.parse(layoutText);
   } catch (err) {
     ztoolkit.log("Show Markdown: failed to parse MinerU layout.json", err);
-    return { message: "layout.json is not valid JSON." };
+    return { layout: null, message: "layout.json is not valid JSON." };
   }
 
   const layout = parseMineruLayout(rawLayout);
   if (!getLayoutBoxCount(layout)) {
-    return { message: "No bounding boxes found in layout.json." };
+    return { layout: null, message: "No bounding boxes found in layout.json." };
   }
+  layout.translationCachePath = getTranslationCachePath(layoutPath);
+  const cachedCount = await applyTranslationCache(layout);
 
-  await enableBoundingBoxes(targetReader, layout);
-  return { message: "Bounding boxes visible" };
+  return {
+    layout,
+    message: cachedCount
+      ? `Loaded layout.json and ${cachedCount} cached translations.`
+      : "Loaded layout.json.",
+  };
 }
 
 async function enableBoundingBoxes(
   reader: PrivatePdfReader,
   layout: MineruLayout,
-) {
+): Promise<ReaderOverlayState> {
   disableBoundingBoxes(reader);
 
   await reader._initPromise;
@@ -239,6 +801,7 @@ async function enableBoundingBoxes(
   );
 
   const state: ReaderOverlayState = {
+    displayConfig: getDisplayConfig(),
     layout,
     cleanupCallbacks: [],
     renderTimer: null,
@@ -252,11 +815,17 @@ async function enableBoundingBoxes(
   }
 
   scheduleRender(reader, state);
+  return state;
 }
 
 function disableBoundingBoxes(reader: PrivatePdfReader) {
   const key = getReaderKey(reader);
   const state = readerOverlayStates.get(key);
+  if (state) {
+    state.translationRunId = ++translationRunCounter;
+    state.translationAbortController?.abort();
+    state.translationAbortController = undefined;
+  }
   if (state?.renderTimer) {
     globalThis.clearTimeout(state.renderTimer);
   }
@@ -277,7 +846,7 @@ function attachRenderListeners(
   state: ReaderOverlayState,
 ) {
   const render = () => {
-    renderBoundingBoxesInWindow(pdfWindow, state.layout);
+    renderBoundingBoxesInWindow(pdfWindow, state);
   };
   const schedule = () => {
     if (state.renderTimer) {
@@ -292,7 +861,6 @@ function attachRenderListeners(
     "pagesinit",
     "scalechanging",
     "rotationchanging",
-    "updateviewarea",
   ]) {
     if (eventBus?.on) {
       eventBus.on(eventName, schedule);
@@ -305,18 +873,10 @@ function attachRenderListeners(
     }
   }
 
-  const viewerContainer = pdfWindow.document.getElementById("viewerContainer");
   pdfWindow.addEventListener("resize", schedule);
   state.cleanupCallbacks.push(() =>
     pdfWindow.removeEventListener("resize", schedule),
   );
-
-  if (viewerContainer) {
-    viewerContainer.addEventListener("scroll", schedule, true);
-    state.cleanupCallbacks.push(() =>
-      viewerContainer.removeEventListener("scroll", schedule, true),
-    );
-  }
 
   render();
 }
@@ -326,14 +886,14 @@ function scheduleRender(reader: PrivatePdfReader, state: ReaderOverlayState) {
   state.renderTimer = globalThis.setTimeout(() => {
     for (const view of getReaderPdfViews(reader)) {
       const pdfWindow = view._iframeWindow;
-      if (pdfWindow) renderBoundingBoxesInWindow(pdfWindow, state.layout);
+      if (pdfWindow) renderBoundingBoxesInWindow(pdfWindow, state);
     }
   }, 0);
 }
 
 function renderBoundingBoxesInWindow(
   pdfWindow: PdfWindowLike,
-  layout: MineruLayout,
+  state: ReaderOverlayState,
 ) {
   const pdfDocument = pdfWindow.document;
   injectPdfStyles(pdfDocument);
@@ -344,7 +904,7 @@ function renderBoundingBoxesInWindow(
 
   for (const pageNode of pageNodes) {
     const pageIndex = Number(pageNode.dataset.pageNumber || 0) - 1;
-    const pageLayout = layout.pages.get(pageIndex);
+    const pageLayout = state.layout.pages.get(pageIndex);
     pageNode
       .querySelectorAll(`.${BBOX_LAYER_CLASS}`)
       .forEach((node: Element) => {
@@ -372,6 +932,7 @@ function renderBoundingBoxesInWindow(
 
     const layer = pdfDocument.createElement("div");
     layer.className = BBOX_LAYER_CLASS;
+    installBBoxLayerEventGuards(layer);
 
     for (const box of pageLayout.boxes) {
       const rectangle = createBoundingBoxNode(
@@ -380,6 +941,7 @@ function renderBoundingBoxesInWindow(
         sourceSize,
         pageWidth,
         pageHeight,
+        state.displayConfig,
       );
       if (rectangle) layer.append(rectangle);
     }
@@ -394,6 +956,7 @@ function createBoundingBoxNode(
   sourceSize: [number, number],
   pageWidth: number,
   pageHeight: number,
+  displayConfig: DisplayConfig,
 ) {
   const [sourceWidth, sourceHeight] = sourceSize;
   if (!sourceWidth || !sourceHeight) return null;
@@ -412,7 +975,83 @@ function createBoundingBoxNode(
   rectangle.style.top = `${top}px`;
   rectangle.style.width = `${width}px`;
   rectangle.style.height = `${height}px`;
-  if (box.label) rectangle.title = box.label;
+  rectangle.style.boxSizing = "border-box";
+  rectangle.style.contain = "paint";
+  rectangle.style.overflow = "hidden";
+  rectangle.style.position = "absolute";
+  rectangle.title = [box.label, box.text, box.translation]
+    .filter(Boolean)
+    .join("\n\n");
+
+  if (box.translation) {
+    rectangle.classList.add("has-translation");
+    rectangle.style.background = displayConfig.translatedBoxColor;
+    rectangle.style.borderColor = displayConfig.translatedBoxBorderColor;
+    rectangle.style.pointerEvents = "auto";
+    const scroll = doc.createElement("div");
+    scroll.className = BBOX_SCROLL_CLASS;
+    scroll.tabIndex = 0;
+    scroll.setAttribute("aria-label", "Translation");
+    scroll.style.color = displayConfig.textColor;
+    const pageScale = getPageScale(sourceSize, pageWidth, pageHeight);
+    const fontSize = getTranslationFontSize(displayConfig, pageScale);
+    scroll.style.setProperty(
+      "--bbox-font-size",
+      `${fontSize}px`,
+    );
+    scroll.style.background = "transparent";
+    scroll.style.boxSizing = "border-box";
+    scroll.style.colorScheme = "light";
+    scroll.style.cursor = "text";
+    scroll.style.fontSize = `${fontSize}px`;
+    scroll.style.height = "100%";
+    scroll.style.inset = "0";
+    scroll.style.lineHeight = "1.25";
+    scroll.style.maxHeight = "100%";
+    scroll.style.maxWidth = "100%";
+    scroll.style.minHeight = "0";
+    scroll.style.outline = "none";
+    scroll.style.overflowX = "hidden";
+    scroll.style.overflowY = "auto";
+    scroll.style.padding = "2px 3px";
+    scroll.style.pointerEvents = "auto";
+    scroll.style.position = "absolute";
+    scroll.style.userSelect = "text";
+    scroll.style.width = "100%";
+    scroll.style.setProperty("-moz-user-select", "text");
+    scroll.style.setProperty("overscroll-behavior", "contain");
+    scroll.style.setProperty("scrollbar-gutter", "stable");
+    scroll.style.setProperty("scrollbar-width", "none");
+
+    const text = doc.createElement("div");
+    text.className = BBOX_TEXT_CLASS;
+    text.textContent = box.translation;
+    text.style.background = "transparent";
+    text.style.color = "inherit";
+    text.style.display = "block";
+    text.style.fontSize = `${fontSize}px`;
+    text.style.lineHeight = "1.25";
+    text.style.maxWidth = "100%";
+    text.style.overflowWrap = "anywhere";
+    text.style.position = "static";
+    text.style.userSelect = "text";
+    text.style.whiteSpace = "pre-wrap";
+    text.style.wordBreak = "break-word";
+    text.style.setProperty("-moz-user-select", "text");
+    scroll.append(text);
+
+    installTranslatedBoxEventGuards(rectangle, scroll);
+    rectangle.append(scroll);
+  } else {
+    rectangle.classList.add("no-translation");
+    rectangle.style.background = colorWithAlpha(
+      displayConfig.untranslatedBoxColor,
+      0.08,
+    );
+    rectangle.style.borderColor = displayConfig.untranslatedBoxColor;
+    rectangle.style.pointerEvents = "none";
+  }
+
   return rectangle;
 }
 
@@ -420,6 +1059,203 @@ function removeBoundingBoxLayers(doc: Document) {
   doc.querySelectorAll(`.${BBOX_LAYER_CLASS}`).forEach((node: Element) => {
     node.remove();
   });
+}
+
+function installBBoxLayerEventGuards(layer: HTMLElement) {
+  const doc = layer.ownerDocument;
+  if (!doc) return;
+  installDocumentSelectionGuard(doc);
+
+  layer.addEventListener(
+    "selectstart",
+    (event) => {
+      const target = event.target as Node | null;
+      if (!target) return;
+      if (closestElement(target, `.${BBOX_SCROLL_CLASS}`)) {
+        event.stopPropagation();
+        return;
+      }
+      if (closestElement(target, `.${BBOX_CLASS}.has-translation`)) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    },
+    true,
+  );
+
+  for (const eventName of ["mousedown", "pointerdown"]) {
+    layer.addEventListener(
+      eventName,
+      (event: Event) => {
+        const target = event.target as Node | null;
+        if (!target) return;
+        const translatedBox = closestElement(
+          target,
+          `.${BBOX_CLASS}.has-translation`,
+        );
+        if (!translatedBox) return;
+        if (!closestElement(target, `.${BBOX_SCROLL_CLASS}`)) {
+          event.preventDefault();
+        }
+        event.stopPropagation();
+      },
+      true,
+    );
+  }
+}
+
+function installDocumentSelectionGuard(doc: Document) {
+  if (guardedSelectionDocuments.has(doc)) return;
+  guardedSelectionDocuments.add(doc);
+
+  doc.addEventListener(
+    "copy",
+    (event) => {
+      const copyEvent = event as ClipboardEvent;
+      const selection = doc.getSelection();
+      if (!selection || selection.rangeCount === 0) return;
+      const anchor = selection.anchorNode;
+      if (!anchor) return;
+      const scroll = closestElement(anchor, `.${BBOX_SCROLL_CLASS}`) as
+        | HTMLElement
+        | null;
+      if (!scroll) return;
+      const copiedText = getSelectionTextInside(selection, scroll);
+      if (!copiedText) return;
+      copyEvent.preventDefault();
+      copyEvent.stopPropagation();
+      copyEvent.clipboardData?.setData("text/plain", copiedText);
+    },
+    true,
+  );
+
+  doc.addEventListener("selectionchange", () => {
+    const selection = doc.getSelection();
+    if (!selection || selection.rangeCount === 0) return;
+    const anchor = selection.anchorNode;
+    if (!anchor) return;
+    const scroll = closestElement(anchor, `.${BBOX_SCROLL_CLASS}`);
+    if (!(scroll instanceof HTMLElement)) return;
+    const focus = selection.focusNode;
+    if (focus && scroll.contains(focus)) return;
+
+    const range = doc.createRange();
+    range.selectNodeContents(scroll);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  });
+}
+
+function installTranslatedBoxEventGuards(
+  rectangle: HTMLElement,
+  scroll: HTMLElement,
+) {
+  let hideScrollbarTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
+  const showScrollbar = () => {
+    if (hideScrollbarTimer) {
+      globalThis.clearTimeout(hideScrollbarTimer);
+      hideScrollbarTimer = null;
+    }
+    scroll.style.setProperty("scrollbar-width", "auto");
+  };
+  const hideScrollbar = () => {
+    if (hideScrollbarTimer) globalThis.clearTimeout(hideScrollbarTimer);
+    hideScrollbarTimer = globalThis.setTimeout(() => {
+      scroll.style.setProperty("scrollbar-width", "none");
+      hideScrollbarTimer = null;
+    }, 500);
+  };
+
+  for (const eventName of ["mouseenter", "mousemove", "focus"]) {
+    scroll.addEventListener(eventName, showScrollbar, true);
+  }
+  scroll.addEventListener("mouseleave", hideScrollbar, true);
+  scroll.addEventListener("blur", hideScrollbar, true);
+
+  scroll.addEventListener(
+    "wheel",
+    (event) => {
+      const wheelEvent = event as WheelEvent;
+      showScrollbar();
+      hideScrollbar();
+      if (scroll.scrollHeight <= scroll.clientHeight) return;
+      const atTop = scroll.scrollTop <= 0;
+      const atBottom =
+        Math.ceil(scroll.scrollTop + scroll.clientHeight) >= scroll.scrollHeight;
+      const goingUp = wheelEvent.deltaY < 0;
+      const goingDown = wheelEvent.deltaY > 0;
+      if ((goingUp && !atTop) || (goingDown && !atBottom)) {
+        wheelEvent.stopPropagation();
+      }
+    },
+    { passive: true },
+  );
+
+  for (const eventName of [
+    "mousedown",
+    "mouseup",
+    "click",
+    "dblclick",
+    "pointerdown",
+    "pointerup",
+    "pointermove",
+    "selectstart",
+  ]) {
+    scroll.addEventListener(
+      eventName,
+      (event: Event) => {
+        event.stopPropagation();
+      },
+      true,
+    );
+  }
+
+  scroll.addEventListener("keydown", (event) => {
+    const keyboardEvent = event as KeyboardEvent;
+    const isSelectAll =
+      (keyboardEvent.ctrlKey || keyboardEvent.metaKey) &&
+      keyboardEvent.key.toLowerCase() === "a";
+    if (!isSelectAll) return;
+    keyboardEvent.preventDefault();
+    keyboardEvent.stopPropagation();
+    const doc = scroll.ownerDocument;
+    if (!doc) return;
+    const selection = doc.getSelection();
+    if (!selection) return;
+    const range = doc.createRange();
+    range.selectNodeContents(scroll);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  });
+
+  rectangle.addEventListener(
+    "pointerdown",
+    (event) => {
+      event.stopPropagation();
+    },
+    true,
+  );
+}
+
+function closestElement(node: Node, selector: string): Element | null {
+  if (node.nodeType === Node.ELEMENT_NODE) {
+    return (node as Element).closest(selector);
+  }
+  return node.parentElement?.closest(selector) || null;
+}
+
+function getSelectionTextInside(
+  selection: Selection,
+  container: HTMLElement,
+): string {
+  const anchor = selection.anchorNode;
+  const focus = selection.focusNode;
+  if (anchor && focus && container.contains(anchor) && container.contains(focus)) {
+    const text = selection.toString().trim();
+    if (text) return text;
+  }
+
+  return container.innerText.trim();
 }
 
 function resolveSourcePageSize(
@@ -479,7 +1315,7 @@ function getMaxBboxSize(pageLayout: MineruPageLayout): [number, number] | null {
 
 function parseMineruLayout(rawLayout: unknown): MineruLayout {
   const pages = new Map<number, MineruPageLayout>();
-  const seenBoxes = new Set<string>();
+  const seenBoxes = new Map<string, MineruBox>();
 
   if (isPlainObject(rawLayout) && Array.isArray(rawLayout.pdf_info)) {
     rawLayout.pdf_info.forEach((page, index) => {
@@ -488,29 +1324,21 @@ function parseMineruLayout(rawLayout: unknown): MineruLayout {
       const pageSize = readPageSize(page);
       ensurePageLayout(pages, pageIndex, pageSize);
 
-      if (Array.isArray(page.layout_bboxes) && page.layout_bboxes.length) {
-        collectBlocks(page.layout_bboxes, pageIndex, pageSize, pages, seenBoxes);
-        return;
-      }
-
       const candidateKeys = [
+        "layout_bboxes",
         "layouts",
         "layout",
         "layout_dets",
         "detections",
         "blocks",
         "para_blocks",
+        "preproc_blocks",
       ];
       for (const key of candidateKeys) {
         const value = page[key];
         if (Array.isArray(value) && value.length) {
           collectBlocks(value, pageIndex, pageSize, pages, seenBoxes);
-          return;
         }
-      }
-
-      if (Array.isArray(page.preproc_blocks)) {
-        collectBlocks(page.preproc_blocks, pageIndex, pageSize, pages, seenBoxes);
       }
     });
   } else if (Array.isArray(rawLayout)) {
@@ -524,6 +1352,8 @@ function parseMineruLayout(rawLayout: unknown): MineruLayout {
       "layout_dets",
       "detections",
       "blocks",
+      "para_blocks",
+      "preproc_blocks",
     ];
     for (const key of pageArrays) {
       if (Array.isArray(rawLayout[key])) {
@@ -539,7 +1369,7 @@ function parseMineruLayout(rawLayout: unknown): MineruLayout {
 function parseArrayLayout(
   value: unknown[],
   pages: Map<number, MineruPageLayout>,
-  seenBoxes: Set<string>,
+  seenBoxes: Map<string, MineruBox>,
 ) {
   if (value.every(Array.isArray)) {
     value.forEach((pageBlocks, pageIndex) => {
@@ -556,7 +1386,7 @@ function collectBlocks(
   fallbackPageIndex: number,
   fallbackPageSize: [number, number] | undefined,
   pages: Map<number, MineruPageLayout>,
-  seenBoxes: Set<string>,
+  seenBoxes: Map<string, MineruBox>,
 ) {
   if (!Array.isArray(blocks)) return;
 
@@ -567,12 +1397,16 @@ function collectBlocks(
     const bbox = readBBox(block);
     if (bbox) {
       const key = `${pageIndex}:${bbox.join(",")}`;
-      if (!seenBoxes.has(key)) {
-        seenBoxes.add(key);
-        ensurePageLayout(pages, pageIndex, pageSize).boxes.push({
-          bbox,
-          label: readBoxLabel(block),
-        });
+      const label = readBoxLabel(block);
+      const text = readBlockText(block);
+      const existing = seenBoxes.get(key);
+      if (existing) {
+        if (!existing.label && label) existing.label = label;
+        if (!existing.text && text) existing.text = text;
+      } else {
+        const box = { pageIndex, bbox, label, text };
+        seenBoxes.set(key, box);
+        ensurePageLayout(pages, pageIndex, pageSize).boxes.push(box);
       }
     } else {
       ensurePageLayout(pages, pageIndex, pageSize);
@@ -587,6 +1421,8 @@ function collectBlocks(
       "layout_dets",
       "detections",
       "blocks",
+      "para_blocks",
+      "preproc_blocks",
     ]) {
       collectBlocks(block[childKey], pageIndex, pageSize, pages, seenBoxes);
     }
@@ -694,12 +1530,317 @@ function readBoxLabel(value: Record<string, unknown>): string | undefined {
   return undefined;
 }
 
+function readBlockText(value: Record<string, unknown>): string | undefined {
+  for (const key of ["text", "content", "table_body"]) {
+    const directValue = value[key];
+    if (typeof directValue === "string" && directValue.trim()) {
+      return normalizeText(directValue);
+    }
+  }
+
+  const lines = value.lines;
+  if (!Array.isArray(lines)) return undefined;
+
+  const lineTexts = lines
+    .map((line) => {
+      if (!isPlainObject(line) || !Array.isArray(line.spans)) return "";
+      return line.spans
+        .map((span) => {
+          if (!isPlainObject(span)) return "";
+          const content = span.content;
+          return typeof content === "string" ? content : "";
+        })
+        .filter(Boolean)
+        .join(" ");
+    })
+    .filter(Boolean);
+
+  return normalizeText(lineTexts.join("\n")) || undefined;
+}
+
+function normalizeText(value: string): string {
+  return value
+    .replace(/\r\n/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 function getLayoutBoxCount(layout: MineruLayout): number {
   let count = 0;
   for (const page of layout.pages.values()) {
     count += page.boxes.length;
   }
   return count;
+}
+
+function getSelectedPageIndexes(
+  layout: MineruLayout,
+  config: TranslationConfig,
+): Set<number> {
+  const pageIndexes = Array.from(layout.pages.keys()).sort((a, b) => a - b);
+  const maxPageIndex = Math.max(...pageIndexes, 0);
+  const included = parsePageSpec(config.pages, maxPageIndex);
+  const selected = included || new Set(pageIndexes);
+  const skipped = parsePageSpec(config.skipPages, maxPageIndex);
+
+  for (const pageIndex of skipped || []) {
+    selected.delete(pageIndex);
+  }
+
+  return selected;
+}
+
+function getTranslatableBoxes(
+  layout: MineruLayout,
+  selectedPageIndexes: Set<number>,
+): MineruBox[] {
+  const boxes: MineruBox[] = [];
+  const skipLabels = new Set(["image", "table", "interline_equation"]);
+
+  for (const pageIndex of Array.from(selectedPageIndexes).sort((a, b) => a - b)) {
+    const page = layout.pages.get(pageIndex);
+    if (!page) continue;
+
+    for (const box of page.boxes) {
+      const text = normalizeText(box.text || "");
+      if (!text) continue;
+      if (box.label && skipLabels.has(box.label)) continue;
+      box.text = text;
+      boxes.push(box);
+    }
+  }
+
+  return boxes;
+}
+
+function createTranslationBatches(boxes: MineruBox[]): MineruBox[][] {
+  const batches: MineruBox[][] = [];
+  for (let index = 0; index < boxes.length; index += TRANSLATION_BATCH_SIZE) {
+    batches.push(boxes.slice(index, index + TRANSLATION_BATCH_SIZE));
+  }
+  return batches;
+}
+
+function getTranslationConcurrency(config: TranslationConfig): number {
+  const value = Number.parseInt(config.concurrency, 10);
+  if (!Number.isInteger(value)) return Number(DEFAULT_TRANSLATION_CONCURRENCY);
+  return Math.max(1, Math.min(MAX_TRANSLATION_CONCURRENCY, value));
+}
+
+function parsePageSpec(
+  value: string,
+  maxPageIndex: number,
+): Set<number> | null {
+  const normalized = value
+    .replace(/[，、；;]/g, ",")
+    .replace(/\s+/g, "")
+    .trim();
+  if (!normalized) return null;
+
+  const pageIndexes = new Set<number>();
+  for (const token of normalized.split(",").filter(Boolean)) {
+    const rangeMatch = token.match(/^(\d+)(?:-|~|到|至)(\d+)$/);
+    if (rangeMatch) {
+      const start = Number(rangeMatch[1]);
+      const end = Number(rangeMatch[2]);
+      if (!Number.isInteger(start) || !Number.isInteger(end)) continue;
+      for (let page = Math.min(start, end); page <= Math.max(start, end); page++) {
+        addPageIndex(pageIndexes, page, maxPageIndex);
+      }
+      continue;
+    }
+
+    const page = Number(token);
+    if (Number.isInteger(page)) addPageIndex(pageIndexes, page, maxPageIndex);
+  }
+
+  return pageIndexes;
+}
+
+function addPageIndex(
+  pageIndexes: Set<number>,
+  oneBasedPage: number,
+  maxPageIndex: number,
+) {
+  const pageIndex = oneBasedPage - 1;
+  if (pageIndex < 0 || pageIndex > maxPageIndex) return;
+  pageIndexes.add(pageIndex);
+}
+
+async function translateBatchWithFallback(
+  endpoint: string,
+  model: string,
+  texts: string[],
+  signal: TranslationAbortSignal,
+): Promise<string[]> {
+  try {
+    return await requestTranslations(endpoint, model, texts, signal);
+  } catch (err) {
+    if (signal.aborted || isAbortError(err)) throw err;
+    if (texts.length === 1) throw err;
+    ztoolkit.log("Show Markdown: batch translation failed, retrying singly", err);
+  }
+
+  const translations: string[] = [];
+  for (const text of texts) {
+    if (signal.aborted) throw new Error("Translation stopped.");
+    const [translation] = await requestTranslations(
+      endpoint,
+      model,
+      [text],
+      signal,
+    );
+    translations.push(translation || "");
+  }
+  return translations;
+}
+
+async function requestTranslations(
+  endpoint: string,
+  model: string,
+  texts: string[],
+  signal: TranslationAbortSignal,
+): Promise<string[]> {
+  const requestInit: RequestInit = {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      stream: false,
+      temperature: 0.2,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a professional academic translator. Translate the user's JSON array of text snippets into Simplified Chinese. Keep names, citations, math, LaTeX, code, and numbers unchanged where appropriate. Return only a valid JSON array of translated strings with the same length and order. Do not use markdown. Do not include reasoning.",
+        },
+        {
+          role: "user",
+          content: `/no_think\n${JSON.stringify(texts)}`,
+        },
+      ],
+    }),
+  };
+  if (isNativeAbortSignal(signal)) requestInit.signal = signal;
+
+  const response = await globalThis.fetch(endpoint, requestInit);
+
+  if (!response.ok) {
+    const detail = await readTranslationErrorMessage(response);
+    throw new Error(
+      `Translation request failed: ${response.status}${
+        detail ? ` - ${detail}` : ""
+      }`,
+    );
+  }
+
+  const data = (await response.json()) as {
+    choices?: Array<{
+      message?: { content?: string };
+      text?: string;
+    }>;
+  };
+  const content =
+    data.choices?.[0]?.message?.content || data.choices?.[0]?.text || "";
+  return parseTranslationArray(content, texts.length);
+}
+
+async function readTranslationErrorMessage(
+  response: Response,
+): Promise<string> {
+  let text = "";
+  try {
+    text = await response.text();
+  } catch {
+    return "";
+  }
+
+  const trimmedText = normalizeText(text);
+  if (!trimmedText) return "";
+
+  try {
+    const data = JSON.parse(trimmedText) as unknown;
+    const message = readErrorMessage(data);
+    if (message) return truncateStatusText(message);
+  } catch {
+    // Fall through to the raw body text.
+  }
+
+  return truncateStatusText(trimmedText);
+}
+
+function readErrorMessage(value: unknown): string {
+  if (typeof value === "string") return normalizeText(value);
+  if (!isPlainObject(value)) return "";
+
+  const directMessage = value.message || value.detail;
+  if (typeof directMessage === "string") return normalizeText(directMessage);
+
+  const error = value.error;
+  if (typeof error === "string") return normalizeText(error);
+  if (isPlainObject(error)) {
+    const errorMessage = error.message || error.detail || error.type;
+    if (typeof errorMessage === "string") {
+      return normalizeText(errorMessage);
+    }
+  }
+
+  return "";
+}
+
+function truncateStatusText(value: string): string {
+  return value.length > 320 ? `${value.slice(0, 317)}...` : value;
+}
+
+function isAbortError(err: unknown): boolean {
+  if (err instanceof Error && err.name === "AbortError") return true;
+  if (!err || typeof err !== "object") return false;
+  return String((err as { name?: unknown }).name || "") === "AbortError";
+}
+
+function isNativeAbortSignal(
+  signal: TranslationAbortSignal,
+): signal is AbortSignal {
+  return typeof (signal as AbortSignal).addEventListener === "function";
+}
+
+function parseTranslationArray(value: string, expectedLength: number): string[] {
+  const withoutThinking = value
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .trim();
+  const jsonText =
+    withoutThinking.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim() ||
+    withoutThinking.slice(
+      Math.max(0, withoutThinking.indexOf("[")),
+      withoutThinking.lastIndexOf("]") + 1,
+    );
+  const parsed = JSON.parse(jsonText);
+  if (!Array.isArray(parsed)) {
+    throw new Error("Translation response is not an array");
+  }
+
+  const translations = parsed.map((entry) => normalizeText(String(entry || "")));
+  if (translations.length !== expectedLength) {
+    throw new Error(
+      `Translation response length mismatch: ${translations.length}/${expectedLength}`,
+    );
+  }
+  return translations;
+}
+
+function getChatCompletionsEndpoint(baseURL: string): string {
+  const trimmed = (baseURL || DEFAULT_TRANSLATION_BASE_URL).trim();
+  const withoutTrailingSlash = trimmed.replace(/\/+$/g, "");
+  if (/\/chat\/completions$/i.test(withoutTrailingSlash)) {
+    return withoutTrailingSlash;
+  }
+  if (/\/v1$/i.test(withoutTrailingSlash)) {
+    return `${withoutTrailingSlash}/chat/completions`;
+  }
+  return `${withoutTrailingSlash}/v1/chat/completions`;
 }
 
 function isBoundingBoxesEnabled(reader: PrivatePdfReader): boolean {
@@ -799,6 +1940,167 @@ function isPdfAttachment(
   return Boolean(attachment.attachmentFilename?.toLowerCase().endsWith(".pdf"));
 }
 
+function createLabeledInput(
+  doc: Document,
+  labelText: string,
+  value: string,
+  placeholder: string,
+) {
+  const wrapper = doc.createElement("label");
+  wrapper.className = "show-markdown-mineru-field";
+
+  const label = doc.createElement("span");
+  label.className = "show-markdown-mineru-field-label";
+  label.textContent = labelText;
+
+  const input = doc.createElement("input");
+  input.className = "show-markdown-mineru-input";
+  input.type = "text";
+  input.value = value;
+  input.placeholder = placeholder;
+
+  wrapper.append(label, input);
+  return { wrapper, input };
+}
+
+function getTranslationConfig(): TranslationConfig {
+  return {
+    baseURL: getPrefString(
+      PREF_TRANSLATION_BASE_URL,
+      DEFAULT_TRANSLATION_BASE_URL,
+    ),
+    model: getPrefString(PREF_TRANSLATION_MODEL, DEFAULT_TRANSLATION_MODEL),
+    pages: getPrefString(PREF_TRANSLATION_PAGES, ""),
+    skipPages: getPrefString(PREF_TRANSLATION_SKIP_PAGES, ""),
+    concurrency: getPrefString(
+      PREF_TRANSLATION_CONCURRENCY,
+      DEFAULT_TRANSLATION_CONCURRENCY,
+    ),
+  };
+}
+
+function saveTranslationConfig(config: TranslationConfig) {
+  Zotero.Prefs.set(
+    PREF_TRANSLATION_BASE_URL,
+    config.baseURL.trim() || DEFAULT_TRANSLATION_BASE_URL,
+    true,
+  );
+  Zotero.Prefs.set(
+    PREF_TRANSLATION_MODEL,
+    config.model.trim() || DEFAULT_TRANSLATION_MODEL,
+    true,
+  );
+  Zotero.Prefs.set(PREF_TRANSLATION_PAGES, config.pages.trim(), true);
+  Zotero.Prefs.set(
+    PREF_TRANSLATION_SKIP_PAGES,
+    config.skipPages.trim(),
+    true,
+  );
+  Zotero.Prefs.set(
+    PREF_TRANSLATION_CONCURRENCY,
+    String(getTranslationConcurrency(config)),
+    true,
+  );
+}
+
+function getDisplayConfig(): DisplayConfig {
+  return {
+    translatedBoxColor: getColorPref(
+      PREF_TRANSLATED_BOX_COLOR,
+      DEFAULT_TRANSLATED_BOX_COLOR,
+    ),
+    translatedBoxBorderColor: getColorPref(
+      PREF_TRANSLATED_BOX_BORDER_COLOR,
+      DEFAULT_TRANSLATED_BOX_BORDER_COLOR,
+    ),
+    untranslatedBoxColor: getColorPref(
+      PREF_UNTRANSLATED_BOX_COLOR,
+      DEFAULT_UNTRANSLATED_BOX_COLOR,
+    ),
+    textColor: getColorPref(
+      PREF_TRANSLATION_TEXT_COLOR,
+      DEFAULT_TRANSLATION_TEXT_COLOR,
+    ),
+    fontSize: getFontSizePref(PREF_TRANSLATION_FONT_SIZE),
+  };
+}
+
+function saveDisplayConfig(config: DisplayConfig): DisplayConfig {
+  const normalizedConfig = normalizeDisplayConfig(config);
+  Zotero.Prefs.set(
+    PREF_TRANSLATED_BOX_COLOR,
+    normalizedConfig.translatedBoxColor,
+    true,
+  );
+  Zotero.Prefs.set(
+    PREF_TRANSLATED_BOX_BORDER_COLOR,
+    normalizedConfig.translatedBoxBorderColor,
+    true,
+  );
+  Zotero.Prefs.set(
+    PREF_UNTRANSLATED_BOX_COLOR,
+    normalizedConfig.untranslatedBoxColor,
+    true,
+  );
+  Zotero.Prefs.set(PREF_TRANSLATION_TEXT_COLOR, normalizedConfig.textColor, true);
+  Zotero.Prefs.set(PREF_TRANSLATION_FONT_SIZE, normalizedConfig.fontSize, true);
+  return normalizedConfig;
+}
+
+function normalizeDisplayConfig(config: DisplayConfig): DisplayConfig {
+  return {
+    translatedBoxColor: normalizeHexColor(
+      config.translatedBoxColor,
+      DEFAULT_TRANSLATED_BOX_COLOR,
+    ),
+    translatedBoxBorderColor: normalizeHexColor(
+      config.translatedBoxBorderColor,
+      DEFAULT_TRANSLATED_BOX_BORDER_COLOR,
+    ),
+    untranslatedBoxColor: normalizeHexColor(
+      config.untranslatedBoxColor,
+      DEFAULT_UNTRANSLATED_BOX_COLOR,
+    ),
+    textColor: normalizeHexColor(config.textColor, DEFAULT_TRANSLATION_TEXT_COLOR),
+    fontSize: normalizeFontSize(config.fontSize),
+  };
+}
+
+function getPrefString(pref: string, fallback: string): string {
+  const value = Zotero.Prefs.get(pref, true);
+  return typeof value === "string" && value.trim() ? value : fallback;
+}
+
+function getColorPref(pref: string, fallback: string): string {
+  return normalizeHexColor(getPrefString(pref, fallback), fallback);
+}
+
+function getFontSizePref(pref: string): string {
+  const value = Zotero.Prefs.get(pref, true);
+  return typeof value === "string"
+    ? normalizeFontSize(value)
+    : DEFAULT_TRANSLATION_FONT_SIZE;
+}
+
+function normalizeHexColor(value: string, fallback: string): string {
+  const trimmed = value.trim();
+  if (/^#[\da-f]{6}$/i.test(trimmed)) return trimmed.toLowerCase();
+  if (/^#[\da-f]{3}$/i.test(trimmed)) {
+    return `#${trimmed
+      .slice(1)
+      .split("")
+      .map((char) => `${char}${char}`)
+      .join("")}`.toLowerCase();
+  }
+  return fallback;
+}
+
+function normalizeFontSize(value: string): string {
+  const numberValue = Number.parseFloat(value);
+  if (!Number.isFinite(numberValue)) return DEFAULT_TRANSLATION_FONT_SIZE;
+  return String(Math.max(6, Math.min(32, Math.round(numberValue))));
+}
+
 function injectPaneStyles(doc: Document) {
   if (doc.getElementById(PANE_STYLE_ID)) return;
   const style = doc.createElement("style");
@@ -834,6 +2136,29 @@ function injectPaneStyles(doc: Document) {
       opacity: 0.55;
     }
 
+    .show-markdown-mineru-field {
+      display: grid;
+      gap: 3px;
+    }
+
+    .show-markdown-mineru-field-label {
+      color: var(--fill-secondary, currentColor);
+      font-size: 0.86em;
+    }
+
+    .show-markdown-mineru-input {
+      appearance: none;
+      background: var(--material-background, transparent);
+      border: 1px solid var(--fill-quinary, rgba(127, 127, 127, 0.35));
+      border-radius: 5px;
+      box-sizing: border-box;
+      color: inherit;
+      font: inherit;
+      min-height: 26px;
+      padding: 3px 7px;
+      width: 100%;
+    }
+
     .show-markdown-mineru-status {
       color: var(--fill-secondary, currentColor);
       font-size: 0.92em;
@@ -844,15 +2169,27 @@ function injectPaneStyles(doc: Document) {
 }
 
 function injectPdfStyles(doc: Document) {
-  if (doc.getElementById(PDF_STYLE_ID)) return;
+  const existingStyle = doc.getElementById(PDF_STYLE_ID);
+  if (
+    existingStyle?.getAttribute("data-show-markdown-style-version") ===
+    PDF_STYLE_VERSION
+  ) {
+    return;
+  }
+  existingStyle?.remove();
+
   const style = doc.createElement("style");
   style.id = PDF_STYLE_ID;
+  style.setAttribute("data-show-markdown-style-version", PDF_STYLE_VERSION);
   style.textContent = `
     .${BBOX_LAYER_CLASS} {
+      contain: layout paint style;
       inset: 0;
       pointer-events: none;
       position: absolute;
+      user-select: none;
       z-index: 30;
+      -moz-user-select: none;
     }
 
     .${BBOX_CLASS} {
@@ -860,7 +2197,82 @@ function injectPdfStyles(doc: Document) {
       border: 1.5px solid rgba(255, 193, 7, 0.95);
       border-radius: 2px;
       box-sizing: border-box;
+      contain: paint;
+      overflow: hidden;
+      pointer-events: none;
       position: absolute;
+    }
+
+    .${BBOX_CLASS}.no-translation {
+      pointer-events: none;
+      user-select: none;
+      -moz-user-select: none;
+    }
+
+    .${BBOX_CLASS}.has-translation {
+      background: #fff;
+      border-color: ${DEFAULT_TRANSLATED_BOX_BORDER_COLOR};
+      contain: paint;
+      overflow: hidden;
+      pointer-events: auto;
+      user-select: none;
+      -moz-user-select: none;
+    }
+
+    .${BBOX_SCROLL_CLASS} {
+      background: transparent;
+      box-sizing: border-box;
+      color: #000;
+      color-scheme: light;
+      cursor: text;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans CJK SC", sans-serif;
+      inset: 0;
+      outline: none;
+      overflow-x: hidden;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      padding: 2px 3px;
+      pointer-events: auto;
+      position: absolute;
+      scrollbar-gutter: stable;
+      scrollbar-width: none;
+      user-select: text;
+      -moz-user-select: text;
+    }
+
+    .${BBOX_CLASS}.has-translation:hover .${BBOX_SCROLL_CLASS},
+    .${BBOX_SCROLL_CLASS}:focus {
+      scrollbar-width: auto;
+    }
+
+    .${BBOX_SCROLL_CLASS}:focus {
+      outline: none;
+    }
+
+    .${BBOX_SCROLL_CLASS}::selection,
+    .${BBOX_SCROLL_CLASS} *::selection {
+      background: rgba(120, 160, 255, 0.45);
+      color: #000;
+    }
+
+    .${BBOX_TEXT_CLASS} {
+      background: transparent;
+      color: inherit;
+      display: block;
+      font-family: inherit;
+      font-size: var(--bbox-font-size, 12px);
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+      position: static;
+      user-select: text;
+      white-space: pre-wrap;
+      word-break: break-word;
+      -moz-user-select: text;
+    }
+
+    .${BBOX_LAYER_CLASS} textarea,
+    .${BBOX_LAYER_CLASS} input {
+      display: none !important;
     }
   `;
   appendStyle(doc, style);
@@ -872,6 +2284,41 @@ function parseCssPixels(element: HTMLElement, property: "width" | "height") {
     view?.getComputedStyle(element)?.[property] || "",
   );
   return Number.isFinite(value) ? value : 0;
+}
+
+function getTranslationFontSize(
+  displayConfig: DisplayConfig,
+  pageScale: number,
+) {
+  const configuredSize = Number.parseFloat(displayConfig.fontSize);
+  const fontSize = Number.isFinite(configuredSize)
+    ? configuredSize
+    : Number(DEFAULT_TRANSLATION_FONT_SIZE);
+  return Math.max(4, fontSize * pageScale);
+}
+
+function getPageScale(
+  sourceSize: [number, number],
+  pageWidth: number,
+  pageHeight: number,
+) {
+  const [sourceWidth, sourceHeight] = sourceSize;
+  if (sourceWidth <= 1 && sourceHeight <= 1) {
+    return Math.max(0.1, Math.min(pageWidth / 612, pageHeight / 792));
+  }
+
+  return Math.max(
+    0.1,
+    Math.min(pageWidth / sourceWidth, pageHeight / sourceHeight),
+  );
+}
+
+function colorWithAlpha(color: string, alpha: number): string {
+  const hex = normalizeHexColor(color, DEFAULT_UNTRANSLATED_BOX_COLOR).slice(1);
+  const red = Number.parseInt(hex.slice(0, 2), 16);
+  const green = Number.parseInt(hex.slice(2, 4), 16);
+  const blue = Number.parseInt(hex.slice(4, 6), 16);
+  return `rgba(${red}, ${green}, ${blue}, ${alpha})`;
 }
 
 function appendStyle(doc: Document, style: HTMLStyleElement) {
