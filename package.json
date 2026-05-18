@@ -1,7 +1,7 @@
 {
   "name": "show-markdown",
   "type": "module",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Create Zotero Markdown attachments for MinerU cache files",
   "config": {
     "addonName": "Show Markdown",
@@ -23,6 +23,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "katex": "^0.16.47",
     "zotero-plugin-toolkit": "^5.1.0-beta.13"
   },
   "devDependencies": {

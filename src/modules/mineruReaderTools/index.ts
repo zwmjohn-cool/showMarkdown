@@ -1,3 +1,4 @@
+import katex from "katex";
 import { config } from "../../../package.json";
 import {
   findCachedMineruLayoutPath,
@@ -10,13 +11,20 @@ const BBOX_LAYER_CLASS = "show-markdown-bbox-layer";
 const BBOX_CLASS = "show-markdown-bbox";
 const BBOX_SCROLL_CLASS = "show-markdown-bbox-scroll";
 const BBOX_TEXT_CLASS = "show-markdown-bbox-text";
+const BBOX_MATH_CLASS = "show-markdown-bbox-math";
 const PANE_STYLE_ID = "show-markdown-mineru-tools-style";
+const PANE_STYLE_VERSION = "2026-05-19-stacked-config-v1";
 const PDF_STYLE_ID = "show-markdown-bbox-style";
 const PDF_STYLE_VERSION = "2026-05-19-hover-scroll-v3";
 const ICON_URI = `chrome://${config.addonRef}/content/icons/icon-20.png`;
 const DEFAULT_TRANSLATION_BASE_URL = "http://127.0.0.1:1234";
 const DEFAULT_TRANSLATION_MODEL = "qwen/qwen3.6-27b";
 const DEFAULT_TRANSLATION_CONCURRENCY = "1";
+const DEFAULT_TRANSLATION_PROMPT =
+  "You are a professional academic translator. Translate the user's text into Simplified Chinese. Keep names, citations, math, LaTeX, code, and numbers unchanged where appropriate. Return only the translated text. Do not return JSON. Do not use markdown. Do not include reasoning. just output plain text, 公式应该由$$包裹。";
+const DEFAULT_BATCH_TRANSLATION_PROMPT =
+  "You are a professional academic translator. Translate the user's JSON array of text snippets into Simplified Chinese. Keep names, citations, math, LaTeX, code, and numbers unchanged where appropriate. Return only a valid JSON array of translated strings with the same length and order. Escape backslashes correctly for JSON. Do not use markdown. Do not include reasoning.";
+const DEFAULT_TRANSLATION_STRIP_STRINGS = "<text>,</text>";
 const MAX_TRANSLATION_CONCURRENCY = 8;
 const TRANSLATION_BATCH_SIZE = 1;
 const TRANSLATION_CACHE_FILE_NAME = "show-markdown-translations.json";
@@ -30,6 +38,8 @@ const PREF_TRANSLATION_MODEL = `${config.prefsPrefix}.translate.model`;
 const PREF_TRANSLATION_PAGES = `${config.prefsPrefix}.translate.pages`;
 const PREF_TRANSLATION_SKIP_PAGES = `${config.prefsPrefix}.translate.skipPages`;
 const PREF_TRANSLATION_CONCURRENCY = `${config.prefsPrefix}.translate.concurrency`;
+const PREF_TRANSLATION_PROMPT = `${config.prefsPrefix}.translate.prompt`;
+const PREF_TRANSLATION_STRIP_STRINGS = `${config.prefsPrefix}.translate.stripStrings`;
 const PREF_TRANSLATED_BOX_COLOR = `${config.prefsPrefix}.display.translatedBoxColor`;
 const PREF_TRANSLATED_BOX_BORDER_COLOR = `${config.prefsPrefix}.display.translatedBoxBorderColor`;
 const PREF_UNTRANSLATED_BOX_COLOR = `${config.prefsPrefix}.display.untranslatedBoxColor`;
@@ -107,6 +117,10 @@ type MineruBox = {
   translation?: string;
 };
 
+type MathTextSegment =
+  | { type: "text"; value: string }
+  | { displayMode: boolean; type: "math"; value: string };
+
 type TranslationCacheEntry = {
   bbox?: [number, number, number, number];
   label?: string;
@@ -134,6 +148,7 @@ type ReaderOverlayState = {
   renderTimer: ReturnType<typeof globalThis.setTimeout> | null;
   translationAbortController?: TranslationAbortController;
   translationRunId?: number;
+  visible: boolean;
 };
 
 type TranslationConfig = {
@@ -142,6 +157,8 @@ type TranslationConfig = {
   pages: string;
   skipPages: string;
   concurrency: string;
+  prompt: string;
+  stripStrings: string;
 };
 
 type DisplayConfig = {
@@ -208,8 +225,8 @@ function renderSection(props: SectionProps) {
 
   const toggleButton = doc.createElement("button");
   toggleButton.type = "button";
-  toggleButton.className = "show-markdown-mineru-button";
-  toggleButton.textContent = "Toggle";
+  toggleButton.className = "show-markdown-mineru-button is-secondary";
+  toggleButton.textContent = "Show Bounding Boxes";
 
   const baseURLControl = createLabeledInput(
     doc,
@@ -245,6 +262,18 @@ function renderSection(props: SectionProps) {
   concurrencyControl.input.min = "1";
   concurrencyControl.input.max = String(MAX_TRANSLATION_CONCURRENCY);
   concurrencyControl.input.step = "1";
+  const promptControl = createLabeledTextarea(
+    doc,
+    "Prompt",
+    translationConfig.prompt,
+    DEFAULT_TRANSLATION_PROMPT,
+  );
+  const stripStringsControl = createLabeledInput(
+    doc,
+    "要去掉的字符串",
+    translationConfig.stripStrings,
+    DEFAULT_TRANSLATION_STRIP_STRINGS,
+  );
   const translatedBoxColorControl = createLabeledInput(
     doc,
     "Text Box",
@@ -286,26 +315,42 @@ function renderSection(props: SectionProps) {
 
   const translateButton = doc.createElement("button");
   translateButton.type = "button";
-  translateButton.className = "show-markdown-mineru-button";
+  translateButton.className = "show-markdown-mineru-button is-primary";
   translateButton.textContent = "Translate";
-
-  const stopButton = doc.createElement("button");
-  stopButton.type = "button";
-  stopButton.className = "show-markdown-mineru-button";
-  stopButton.textContent = "Stop";
-  stopButton.disabled = true;
 
   const status = doc.createElement("div");
   status.className = "show-markdown-mineru-status";
+  let activeTranslationStatus = "";
+  let isStartingTranslation = false;
 
   const refreshButtonState = (syncStatus = false) => {
     const reader = findOpenPdfReaderForItem(item);
-    const isVisible = reader ? isBoundingBoxesEnabled(reader) : false;
     const state = reader ? readerOverlayStates.get(getReaderKey(reader)) : null;
+    const isVisible = Boolean(state?.visible);
     const isTranslating = Boolean(state?.translationAbortController);
     toggleButton.classList.toggle("is-active", isVisible);
-    stopButton.disabled = !isTranslating;
-    if (syncStatus) status.textContent = isVisible ? "Bounding boxes visible" : "";
+    toggleButton.textContent = isVisible
+      ? "Hide Bounding Boxes"
+      : "Show Bounding Boxes";
+    translateButton.classList.toggle("is-danger", isTranslating);
+    translateButton.classList.toggle("is-primary", !isTranslating);
+    translateButton.disabled = isStartingTranslation && !isTranslating;
+    translateButton.textContent = isTranslating
+      ? "Stop Translation"
+      : isStartingTranslation
+        ? "Starting..."
+        : "Translate";
+    if (isTranslating && activeTranslationStatus) {
+      status.textContent = activeTranslationStatus;
+      return;
+    }
+    if (syncStatus) {
+      status.textContent = isVisible
+        ? "Bounding boxes visible"
+        : state
+          ? "Bounding boxes hidden"
+          : "";
+    }
   };
 
   const readDisplayConfig = (): DisplayConfig => ({
@@ -342,42 +387,74 @@ function renderSection(props: SectionProps) {
   });
 
   translateButton.addEventListener("click", async () => {
+    const reader = findOpenPdfReaderForItem(item) || getActivePdfReader();
+    const state = reader ? readerOverlayStates.get(getReaderKey(reader)) : null;
+    if (state?.translationAbortController) {
+      const result = stopTranslation(item);
+      activeTranslationStatus = "";
+      isStartingTranslation = false;
+      status.textContent = result.message;
+      refreshButtonState();
+      return;
+    }
+    if (isStartingTranslation) return;
+
     const config: TranslationConfig = {
       baseURL: baseURLControl.input.value,
       model: modelControl.input.value,
       pages: pagesControl.input.value,
       skipPages: skipPagesControl.input.value,
       concurrency: concurrencyControl.input.value,
+      prompt: promptControl.textarea.value,
+      stripStrings: stripStringsControl.input.value,
     };
     saveTranslationConfig(config);
     applyDisplayConfig();
 
-    toggleButton.disabled = true;
-    translateButton.disabled = true;
-    stopButton.disabled = false;
+    isStartingTranslation = true;
     status.textContent = "Preparing translation...";
+    refreshButtonState();
     try {
       const result = await translateBoundingBoxes(item, config, (message) => {
+        isStartingTranslation = false;
+        activeTranslationStatus = message;
         status.textContent = message;
         refreshButtonState();
       });
+      activeTranslationStatus = "";
       status.textContent = result.message;
     } catch (err) {
+      activeTranslationStatus = "";
       ztoolkit.log("Show Markdown: translation failed", err);
       status.textContent =
         err instanceof Error ? err.message : "Translation failed.";
     } finally {
-      toggleButton.disabled = false;
-      translateButton.disabled = false;
-      stopButton.disabled = true;
+      isStartingTranslation = false;
       refreshButtonState();
     }
   });
 
-  stopButton.addEventListener("click", () => {
-    const result = stopTranslation(item);
-    status.textContent = result.message;
-    refreshButtonState();
+  promptControl.textarea.addEventListener("change", () => {
+    saveTranslationConfig({
+      baseURL: baseURLControl.input.value,
+      model: modelControl.input.value,
+      pages: pagesControl.input.value,
+      skipPages: skipPagesControl.input.value,
+      concurrency: concurrencyControl.input.value,
+      prompt: promptControl.textarea.value,
+      stripStrings: stripStringsControl.input.value,
+    });
+  });
+  stripStringsControl.input.addEventListener("change", () => {
+    saveTranslationConfig({
+      baseURL: baseURLControl.input.value,
+      model: modelControl.input.value,
+      pages: pagesControl.input.value,
+      skipPages: skipPagesControl.input.value,
+      concurrency: concurrencyControl.input.value,
+      prompt: promptControl.textarea.value,
+      stripStrings: stripStringsControl.input.value,
+    });
   });
 
   for (const control of [
@@ -391,22 +468,35 @@ function renderSection(props: SectionProps) {
     control.input.addEventListener("change", () => applyDisplayConfig(true));
   }
 
-  container.append(
-    toggleButton,
+  const actions = doc.createElement("div");
+  actions.className = "show-markdown-mineru-actions";
+  actions.append(toggleButton, translateButton);
+
+  const translationGroup = createConfigGroup(doc, "Translation");
+  translationGroup.append(
     baseURLControl.wrapper,
     modelControl.wrapper,
+    promptControl.wrapper,
+    stripStringsControl.wrapper,
+  );
+
+  const pageGroup = createConfigGroup(doc, "Pages");
+  pageGroup.append(
     pagesControl.wrapper,
     skipPagesControl.wrapper,
     concurrencyControl.wrapper,
+  );
+
+  const displayGroup = createConfigGroup(doc, "Display");
+  displayGroup.append(
     translatedBoxColorControl.wrapper,
     translatedBoxBorderColorControl.wrapper,
     untranslatedBoxColorControl.wrapper,
     textColorControl.wrapper,
     fontSizeControl.wrapper,
-    translateButton,
-    stopButton,
-    status,
   );
+
+  container.append(actions, status, translationGroup, pageGroup, displayGroup);
   body.append(container);
   refreshButtonState(true);
 }
@@ -426,9 +516,14 @@ async function toggleBoundingBoxes(
   const targetReader = reader || findOpenPdfReaderForItem(pdfAttachment);
   if (!targetReader) return { message: "Open this PDF in Zotero reader first." };
 
-  if (isBoundingBoxesEnabled(targetReader)) {
-    disableBoundingBoxes(targetReader);
-    return { message: "Bounding boxes hidden" };
+  const existingState = readerOverlayStates.get(getReaderKey(targetReader));
+  if (existingState) {
+    setBoundingBoxesVisible(targetReader, existingState, !existingState.visible);
+    return {
+      message: existingState.visible
+        ? "Bounding boxes visible"
+        : "Bounding boxes hidden",
+    };
   }
 
   const layoutResult = await loadMineruLayout(pdfAttachment);
@@ -492,7 +587,7 @@ async function translateBoundingBoxes(
     savePromise = savePromise.then(() => saveTranslationCache(state.layout));
     return savePromise;
   };
-  onProgress(`Translating 0/${boxes.length} (${progressSuffix})...`);
+  onProgress(`Translating block 0/${boxes.length} (${progressSuffix})...`);
 
   try {
     const translateWorker = async () => {
@@ -512,6 +607,8 @@ async function translateBoundingBoxes(
         const translations = await translateBatchWithFallback(
           endpoint,
           config.model,
+          config.prompt,
+          config.stripStrings,
           batch.map((box) => box.text || ""),
           abortController.signal,
         );
@@ -526,12 +623,11 @@ async function translateBoundingBoxes(
           box.translation = translations[index] || "";
         });
         completedCount += batch.length;
-        await queueSave();
-
         scheduleRender(targetReader, state);
         onProgress(
-          `Translating ${Math.min(completedCount, boxes.length)}/${boxes.length} (${progressSuffix})...`,
+          `Translating block ${Math.min(completedCount, boxes.length)}/${boxes.length} (${progressSuffix})...`,
         );
+        queueSave();
       }
     };
 
@@ -587,6 +683,27 @@ function updateActiveDisplayConfig(item: Zotero.Item, config: DisplayConfig) {
 
   state.displayConfig = config;
   scheduleRender(reader, state);
+}
+
+function setBoundingBoxesVisible(
+  reader: PrivatePdfReader,
+  state: ReaderOverlayState,
+  visible: boolean,
+) {
+  state.visible = visible;
+  if (visible) {
+    scheduleRender(reader, state);
+    return;
+  }
+
+  if (state.renderTimer) {
+    globalThis.clearTimeout(state.renderTimer);
+    state.renderTimer = null;
+  }
+  for (const view of getReaderPdfViews(reader)) {
+    const pdfDocument = view._iframeWindow?.document;
+    if (pdfDocument) removeBoundingBoxLayers(pdfDocument);
+  }
 }
 
 function createTranslationAbortController(
@@ -805,6 +922,7 @@ async function enableBoundingBoxes(
     layout,
     cleanupCallbacks: [],
     renderTimer: null,
+    visible: true,
   };
   readerOverlayStates.set(getReaderKey(reader), state);
 
@@ -897,6 +1015,11 @@ function renderBoundingBoxesInWindow(
 ) {
   const pdfDocument = pdfWindow.document;
   injectPdfStyles(pdfDocument);
+
+  if (!state.visible) {
+    removeBoundingBoxLayers(pdfDocument);
+    return;
+  }
 
   const pageNodes = Array.from(
     pdfDocument.querySelectorAll(".page[data-page-number]"),
@@ -1025,7 +1148,6 @@ function createBoundingBoxNode(
 
     const text = doc.createElement("div");
     text.className = BBOX_TEXT_CLASS;
-    text.textContent = box.translation;
     text.style.background = "transparent";
     text.style.color = "inherit";
     text.style.display = "block";
@@ -1038,6 +1160,7 @@ function createBoundingBoxNode(
     text.style.whiteSpace = "pre-wrap";
     text.style.wordBreak = "break-word";
     text.style.setProperty("-moz-user-select", "text");
+    renderTextWithMath(doc, text, box.translation);
     scroll.append(text);
 
     installTranslatedBoxEventGuards(rectangle, scroll);
@@ -1053,6 +1176,118 @@ function createBoundingBoxNode(
   }
 
   return rectangle;
+}
+
+function renderTextWithMath(doc: Document, container: HTMLElement, value = "") {
+  container.replaceChildren();
+
+  for (const segment of parseMathText(value)) {
+    if (segment.type === "text") {
+      container.append(doc.createTextNode(segment.value));
+      continue;
+    }
+
+    const wrapper = doc.createElement(segment.displayMode ? "div" : "span");
+    wrapper.className = `${BBOX_MATH_CLASS} ${
+      segment.displayMode ? "is-display" : "is-inline"
+    }`;
+    wrapper.setAttribute("data-tex", segment.value);
+
+    try {
+      wrapper.innerHTML = katex.renderToString(segment.value, {
+        displayMode: segment.displayMode,
+        output: "mathml",
+        strict: "ignore",
+        throwOnError: false,
+        trust: false,
+      });
+    } catch (err) {
+      ztoolkit.log("Show Markdown: failed to render math", err);
+      wrapper.textContent = segment.displayMode
+        ? `$$${segment.value}$$`
+        : `$${segment.value}$`;
+    }
+
+    container.append(wrapper);
+  }
+}
+
+function parseMathText(value: string): MathTextSegment[] {
+  const segments: MathTextSegment[] = [];
+  let cursor = 0;
+
+  while (cursor < value.length) {
+    const opener = findNextMathDelimiter(value, cursor);
+    if (!opener) {
+      segments.push({ type: "text", value: value.slice(cursor) });
+      break;
+    }
+
+    if (opener.index > cursor) {
+      segments.push({ type: "text", value: value.slice(cursor, opener.index) });
+    }
+
+    const contentStart = opener.index + opener.length;
+    const closerIndex = findClosingMathDelimiter(
+      value,
+      contentStart,
+      opener.length,
+    );
+    if (closerIndex < 0) {
+      segments.push({ type: "text", value: value.slice(opener.index) });
+      break;
+    }
+
+    const math = value.slice(contentStart, closerIndex).trim();
+    if (math) {
+      segments.push({
+        displayMode: opener.length === 2,
+        type: "math",
+        value: math,
+      });
+    } else {
+      segments.push({
+        type: "text",
+        value: value.slice(opener.index, closerIndex + opener.length),
+      });
+    }
+    cursor = closerIndex + opener.length;
+  }
+
+  return segments.length ? segments : [{ type: "text", value }];
+}
+
+function findNextMathDelimiter(value: string, start: number) {
+  for (let index = start; index < value.length; index++) {
+    if (value[index] !== "$" || isEscaped(value, index)) continue;
+    const isDisplay = value[index + 1] === "$";
+    return { index, length: isDisplay ? 2 : 1 };
+  }
+  return null;
+}
+
+function findClosingMathDelimiter(
+  value: string,
+  start: number,
+  delimiterLength: number,
+) {
+  for (let index = start; index < value.length; index++) {
+    if (value[index] !== "$" || isEscaped(value, index)) continue;
+    if (delimiterLength === 2) {
+      if (value[index + 1] === "$") return index;
+      continue;
+    }
+    if (value[index + 1] !== "$") return index;
+  }
+  return -1;
+}
+
+function isEscaped(value: string, index: number) {
+  let slashCount = 0;
+  for (let cursor = index - 1; cursor >= 0 && value[cursor] === "\\"; cursor--) {
+    slashCount++;
+  }
+  return slashCount % 2 === 1;
 }
 
 function removeBoundingBoxLayers(doc: Document) {
@@ -1671,11 +1906,20 @@ function addPageIndex(
 async function translateBatchWithFallback(
   endpoint: string,
   model: string,
+  prompt: string,
+  stripStrings: string,
   texts: string[],
   signal: TranslationAbortSignal,
 ): Promise<string[]> {
   try {
-    return await requestTranslations(endpoint, model, texts, signal);
+    return await requestTranslations(
+      endpoint,
+      model,
+      prompt,
+      stripStrings,
+      texts,
+      signal,
+    );
   } catch (err) {
     if (signal.aborted || isAbortError(err)) throw err;
     if (texts.length === 1) throw err;
@@ -1688,6 +1932,8 @@ async function translateBatchWithFallback(
     const [translation] = await requestTranslations(
       endpoint,
       model,
+      prompt,
+      stripStrings,
       [text],
       signal,
     );
@@ -1699,9 +1945,13 @@ async function translateBatchWithFallback(
 async function requestTranslations(
   endpoint: string,
   model: string,
+  prompt: string,
+  stripStrings: string,
   texts: string[],
   signal: TranslationAbortSignal,
 ): Promise<string[]> {
+  const singleText = texts.length === 1 ? texts[0] : "";
+  const systemPrompt = normalizeText(prompt || "") || DEFAULT_TRANSLATION_PROMPT;
   const requestInit: RequestInit = {
     method: "POST",
     headers: {
@@ -1714,12 +1964,13 @@ async function requestTranslations(
       messages: [
         {
           role: "system",
-          content:
-            "You are a professional academic translator. Translate the user's JSON array of text snippets into Simplified Chinese. Keep names, citations, math, LaTeX, code, and numbers unchanged where appropriate. Return only a valid JSON array of translated strings with the same length and order. Do not use markdown. Do not include reasoning.",
+          content: singleText ? systemPrompt : DEFAULT_BATCH_TRANSLATION_PROMPT,
         },
         {
           role: "user",
-          content: `/no_think\n${JSON.stringify(texts)}`,
+          content: singleText
+            ? `/no_think\nTranslate the following source text. Return only the translation, without wrappers or labels.\n\nSOURCE:\n${singleText}`
+            : `/no_think\n${JSON.stringify(texts)}`,
         },
       ],
     }),
@@ -1745,7 +1996,12 @@ async function requestTranslations(
   };
   const content =
     data.choices?.[0]?.message?.content || data.choices?.[0]?.text || "";
-  return parseTranslationArray(content, texts.length);
+  if (singleText) {
+    return [cleanTranslationText(parseSingleTranslation(content), stripStrings)];
+  }
+  return parseTranslationArray(content, texts.length).map((translation) =>
+    cleanTranslationText(translation, stripStrings),
+  );
 }
 
 async function readTranslationErrorMessage(
@@ -1817,7 +2073,7 @@ function parseTranslationArray(value: string, expectedLength: number): string[] 
       Math.max(0, withoutThinking.indexOf("[")),
       withoutThinking.lastIndexOf("]") + 1,
     );
-  const parsed = JSON.parse(jsonText);
+  const parsed = parseJsonWithLooseBackslashes(jsonText);
   if (!Array.isArray(parsed)) {
     throw new Error("Translation response is not an array");
   }
@@ -1831,6 +2087,59 @@ function parseTranslationArray(value: string, expectedLength: number): string[] 
   return translations;
 }
 
+function parseSingleTranslation(value: string): string {
+  let text = value.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+  const fenced = text.match(/```(?:text|markdown|json)?\s*([\s\S]*?)```/i);
+  if (fenced?.[1]) text = fenced[1].trim();
+
+  if (text.startsWith("[") && text.endsWith("]")) {
+    try {
+      const parsed = parseJsonWithLooseBackslashes(text);
+      if (Array.isArray(parsed)) {
+        return normalizeText(String(parsed[0] || ""));
+      }
+    } catch {
+      // Fall through to plain text cleanup.
+    }
+  }
+
+  if (
+    (text.startsWith('"') && text.endsWith('"')) ||
+    (text.startsWith("'") && text.endsWith("'"))
+  ) {
+    text = text.slice(1, -1);
+  }
+
+  return normalizeText(text);
+}
+
+function cleanTranslationText(value: string, stripStrings: string): string {
+  let text = value;
+  for (const token of parseStripStrings(stripStrings)) {
+    text = text.split(token).join("");
+  }
+  return normalizeText(text);
+}
+
+function parseStripStrings(value: string): string[] {
+  return value
+    .split(/[，,]/g)
+    .map((token) => token.trim())
+    .filter(Boolean);
+}
+
+function parseJsonWithLooseBackslashes(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch (err) {
+    const repaired = value.replace(
+      /\\(?!["\\/bfnrtu])/g,
+      "\\\\",
+    );
+    return JSON.parse(repaired);
+  }
+}
+
 function getChatCompletionsEndpoint(baseURL: string): string {
   const trimmed = (baseURL || DEFAULT_TRANSLATION_BASE_URL).trim();
   const withoutTrailingSlash = trimmed.replace(/\/+$/g, "");
@@ -1841,10 +2150,6 @@ function getChatCompletionsEndpoint(baseURL: string): string {
     return `${withoutTrailingSlash}/chat/completions`;
   }
   return `${withoutTrailingSlash}/v1/chat/completions`;
-}
-
-function isBoundingBoxesEnabled(reader: PrivatePdfReader): boolean {
-  return readerOverlayStates.has(getReaderKey(reader));
 }
 
 function getAllPdfReaders(): PrivatePdfReader[] {
@@ -1963,6 +2268,42 @@ function createLabeledInput(
   return { wrapper, input };
 }
 
+function createConfigGroup(doc: Document, title: string) {
+  const section = doc.createElement("section");
+  section.className = "show-markdown-mineru-config-group";
+
+  const heading = doc.createElement("div");
+  heading.className = "show-markdown-mineru-config-heading";
+  heading.textContent = title;
+
+  section.append(heading);
+  return section;
+}
+
+function createLabeledTextarea(
+  doc: Document,
+  labelText: string,
+  value: string,
+  placeholder: string,
+) {
+  const wrapper = doc.createElement("label");
+  wrapper.className = "show-markdown-mineru-field";
+
+  const label = doc.createElement("span");
+  label.className = "show-markdown-mineru-field-label";
+  label.textContent = labelText;
+
+  const textarea = doc.createElement("textarea");
+  textarea.className = "show-markdown-mineru-textarea";
+  textarea.value = value;
+  textarea.placeholder = placeholder;
+  textarea.rows = 7;
+  textarea.spellcheck = false;
+
+  wrapper.append(label, textarea);
+  return { wrapper, textarea };
+}
+
 function getTranslationConfig(): TranslationConfig {
   return {
     baseURL: getPrefString(
@@ -1975,6 +2316,11 @@ function getTranslationConfig(): TranslationConfig {
     concurrency: getPrefString(
       PREF_TRANSLATION_CONCURRENCY,
       DEFAULT_TRANSLATION_CONCURRENCY,
+    ),
+    prompt: getPrefString(PREF_TRANSLATION_PROMPT, DEFAULT_TRANSLATION_PROMPT),
+    stripStrings: getPrefString(
+      PREF_TRANSLATION_STRIP_STRINGS,
+      DEFAULT_TRANSLATION_STRIP_STRINGS,
     ),
   };
 }
@@ -1999,6 +2345,16 @@ function saveTranslationConfig(config: TranslationConfig) {
   Zotero.Prefs.set(
     PREF_TRANSLATION_CONCURRENCY,
     String(getTranslationConcurrency(config)),
+    true,
+  );
+  Zotero.Prefs.set(
+    PREF_TRANSLATION_PROMPT,
+    config.prompt.trim() || DEFAULT_TRANSLATION_PROMPT,
+    true,
+  );
+  Zotero.Prefs.set(
+    PREF_TRANSLATION_STRIP_STRINGS,
+    config.stripStrings.trim() || DEFAULT_TRANSLATION_STRIP_STRINGS,
     true,
   );
 }
@@ -2102,33 +2458,87 @@ function normalizeFontSize(value: string): string {
 }
 
 function injectPaneStyles(doc: Document) {
-  if (doc.getElementById(PANE_STYLE_ID)) return;
+  const existingStyle = doc.getElementById(PANE_STYLE_ID);
+  if (
+    existingStyle?.getAttribute("data-show-markdown-style-version") ===
+    PANE_STYLE_VERSION
+  ) {
+    return;
+  }
+  existingStyle?.remove();
+
   const style = doc.createElement("style");
   style.id = PANE_STYLE_ID;
+  style.setAttribute("data-show-markdown-style-version", PANE_STYLE_VERSION);
   style.textContent = `
     .show-markdown-mineru-menu {
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      padding: 8px 0;
+      box-sizing: border-box;
+      display: flex !important;
+      flex-direction: column !important;
+      gap: 10px !important;
+      padding: 8px 2px 10px;
+      width: 100%;
+    }
+
+    .show-markdown-mineru-actions {
+      background: var(--material-background, rgba(127, 127, 127, 0.08));
+      border: 1px solid var(--fill-quinary, rgba(127, 127, 127, 0.28));
+      border-radius: 8px;
+      box-sizing: border-box;
+      display: flex !important;
+      flex-direction: column !important;
+      gap: 8px !important;
+      padding: 6px;
+      position: sticky;
+      top: 0;
+      width: 100%;
+      z-index: 2;
     }
 
     .show-markdown-mineru-button {
       appearance: none;
-      border: 1px solid var(--fill-quinary, rgba(127, 127, 127, 0.35));
+      border: 1px solid transparent;
       border-radius: 6px;
-      background: var(--material-background, transparent);
+      background: var(--fill-quaternary, rgba(127, 127, 127, 0.16));
       color: inherit;
       cursor: pointer;
-      font: inherit;
-      min-height: 28px;
-      padding: 4px 10px;
-      text-align: left;
+      flex: 1 1 0;
+      font: menu;
+      font-weight: 600;
+      min-width: 0;
+      min-height: 30px;
+      padding: 5px 8px;
+      text-align: center;
+      width: 100%;
     }
 
-    .show-markdown-mineru-button:hover:not(:disabled),
-    .show-markdown-mineru-button.is-active {
-      background: var(--fill-quaternary, rgba(127, 127, 127, 0.16));
+    .show-markdown-mineru-button:hover:not(:disabled) {
+      filter: brightness(1.08);
+    }
+
+    .show-markdown-mineru-button:focus-visible {
+      outline: 2px solid rgba(80, 145, 255, 0.75);
+      outline-offset: 1px;
+    }
+
+    .show-markdown-mineru-button.is-secondary {
+      background: rgba(80, 145, 255, 0.16);
+      border-color: rgba(80, 145, 255, 0.34);
+    }
+
+    .show-markdown-mineru-button.is-secondary.is-active {
+      background: rgba(80, 145, 255, 0.32);
+      border-color: rgba(80, 145, 255, 0.65);
+    }
+
+    .show-markdown-mineru-button.is-primary {
+      background: rgba(45, 164, 78, 0.18);
+      border-color: rgba(45, 164, 78, 0.42);
+    }
+
+    .show-markdown-mineru-button.is-danger {
+      background: rgba(220, 80, 70, 0.18);
+      border-color: rgba(220, 80, 70, 0.42);
     }
 
     .show-markdown-mineru-button:disabled {
@@ -2136,14 +2546,47 @@ function injectPaneStyles(doc: Document) {
       opacity: 0.55;
     }
 
+    .show-markdown-mineru-config-group {
+      background: var(--material-background, rgba(127, 127, 127, 0.06));
+      border: 1px solid var(--fill-quinary, rgba(127, 127, 127, 0.22));
+      border-radius: 8px;
+      box-sizing: border-box;
+      display: flex !important;
+      flex-direction: column !important;
+      gap: 9px !important;
+      align-items: stretch !important;
+      padding: 9px;
+      width: 100%;
+    }
+
+    .show-markdown-mineru-config-heading {
+      color: var(--fill-secondary, currentColor);
+      font-size: 0.78em;
+      font-weight: 700;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
     .show-markdown-mineru-field {
-      display: grid;
-      gap: 3px;
+      box-sizing: border-box;
+      display: flex !important;
+      flex-direction: column !important;
+      gap: 4px !important;
+      align-items: stretch !important;
+      justify-content: flex-start !important;
+      margin: 0;
+      min-width: 0;
+      text-align: left;
+      width: 100% !important;
     }
 
     .show-markdown-mineru-field-label {
       color: var(--fill-secondary, currentColor);
-      font-size: 0.86em;
+      display: block;
+      font-size: 0.82em;
+      font-weight: 600;
+      line-height: 1.25;
+      text-align: left;
     }
 
     .show-markdown-mineru-input {
@@ -2153,16 +2596,50 @@ function injectPaneStyles(doc: Document) {
       border-radius: 5px;
       box-sizing: border-box;
       color: inherit;
+      display: block;
       font: inherit;
-      min-height: 26px;
-      padding: 3px 7px;
-      width: 100%;
+      min-height: 28px;
+      min-width: 0;
+      padding: 4px 7px;
+      width: 100% !important;
+    }
+
+    .show-markdown-mineru-input[type="color"] {
+      align-self: flex-start;
+      min-height: 30px;
+      padding: 2px;
+      width: 96px !important;
+    }
+
+    .show-markdown-mineru-input:focus,
+    .show-markdown-mineru-textarea:focus {
+      border-color: rgba(80, 145, 255, 0.7);
+      outline: none;
+    }
+
+    .show-markdown-mineru-textarea {
+      appearance: none;
+      background: var(--material-background, transparent);
+      border: 1px solid var(--fill-quinary, rgba(127, 127, 127, 0.35));
+      border-radius: 5px;
+      box-sizing: border-box;
+      color: inherit;
+      display: block;
+      font: inherit;
+      min-height: 120px;
+      min-width: 0;
+      padding: 6px 7px;
+      resize: vertical;
+      width: 100% !important;
     }
 
     .show-markdown-mineru-status {
+      background: rgba(127, 127, 127, 0.08);
+      border-radius: 6px;
       color: var(--fill-secondary, currentColor);
       font-size: 0.92em;
-      min-height: 1.2em;
+      min-height: 1.3em;
+      padding: 5px 7px;
     }
   `;
   appendStyle(doc, style);
@@ -2268,6 +2745,35 @@ function injectPdfStyles(doc: Document) {
       white-space: pre-wrap;
       word-break: break-word;
       -moz-user-select: text;
+    }
+
+    .${BBOX_MATH_CLASS} {
+      color: inherit;
+      user-select: text;
+      -moz-user-select: text;
+    }
+
+    .${BBOX_MATH_CLASS}.is-inline {
+      display: inline-block;
+      max-width: 100%;
+      overflow-x: auto;
+      overflow-y: hidden;
+      vertical-align: -0.2em;
+    }
+
+    .${BBOX_MATH_CLASS}.is-display {
+      display: block;
+      margin: 0.2em 0;
+      max-width: 100%;
+      overflow-x: auto;
+      overflow-y: hidden;
+      text-align: center;
+    }
+
+    .${BBOX_MATH_CLASS} math {
+      color: inherit;
+      font-size: 1em;
+      max-width: 100%;
     }
 
     .${BBOX_LAYER_CLASS} textarea,
