@@ -13,7 +13,7 @@ const BBOX_SCROLL_CLASS = "show-markdown-bbox-scroll";
 const BBOX_TEXT_CLASS = "show-markdown-bbox-text";
 const BBOX_MATH_CLASS = "show-markdown-bbox-math";
 const PANE_STYLE_ID = "show-markdown-mineru-tools-style";
-const PANE_STYLE_VERSION = "2026-05-19-stacked-config-v1";
+const PANE_STYLE_VERSION = "2026-05-19-page-tabs-v1";
 const PDF_STYLE_ID = "show-markdown-bbox-style";
 const PDF_STYLE_VERSION = "2026-05-19-hover-scroll-v3";
 const ICON_URI = `chrome://${config.addonRef}/content/icons/icon-20.png`;
@@ -25,6 +25,7 @@ const DEFAULT_TRANSLATION_PROMPT =
 const DEFAULT_BATCH_TRANSLATION_PROMPT =
   "You are a professional academic translator. Translate the user's JSON array of text snippets into Simplified Chinese. Keep names, citations, math, LaTeX, code, and numbers unchanged where appropriate. Return only a valid JSON array of translated strings with the same length and order. Escape backslashes correctly for JSON. Do not use markdown. Do not include reasoning.";
 const DEFAULT_TRANSLATION_STRIP_STRINGS = "<text>,</text>";
+const DEFAULT_TRANSLATION_CLEAR_PAGES = "all";
 const MAX_TRANSLATION_CONCURRENCY = 8;
 const TRANSLATION_BATCH_SIZE = 1;
 const TRANSLATION_CACHE_FILE_NAME = "show-markdown-translations.json";
@@ -40,6 +41,7 @@ const PREF_TRANSLATION_SKIP_PAGES = `${config.prefsPrefix}.translate.skipPages`;
 const PREF_TRANSLATION_CONCURRENCY = `${config.prefsPrefix}.translate.concurrency`;
 const PREF_TRANSLATION_PROMPT = `${config.prefsPrefix}.translate.prompt`;
 const PREF_TRANSLATION_STRIP_STRINGS = `${config.prefsPrefix}.translate.stripStrings`;
+const PREF_TRANSLATION_CLEAR_PAGES = `${config.prefsPrefix}.translate.clearPages`;
 const PREF_TRANSLATED_BOX_COLOR = `${config.prefsPrefix}.display.translatedBoxColor`;
 const PREF_TRANSLATED_BOX_BORDER_COLOR = `${config.prefsPrefix}.display.translatedBoxBorderColor`;
 const PREF_UNTRANSLATED_BOX_COLOR = `${config.prefsPrefix}.display.untranslatedBoxColor`;
@@ -148,6 +150,7 @@ type ReaderOverlayState = {
   renderTimer: ReturnType<typeof globalThis.setTimeout> | null;
   translationAbortController?: TranslationAbortController;
   translationRunId?: number;
+  showOcrText: boolean;
   visible: boolean;
 };
 
@@ -157,6 +160,7 @@ type TranslationConfig = {
   pages: string;
   skipPages: string;
   concurrency: string;
+  clearPages: string;
   prompt: string;
   stripStrings: string;
 };
@@ -228,6 +232,11 @@ function renderSection(props: SectionProps) {
   toggleButton.className = "show-markdown-mineru-button is-secondary";
   toggleButton.textContent = "Show Bounding Boxes";
 
+  const ocrTextButton = doc.createElement("button");
+  ocrTextButton.type = "button";
+  ocrTextButton.className = "show-markdown-mineru-button is-secondary";
+  ocrTextButton.textContent = "Show OCR Text";
+
   const baseURLControl = createLabeledInput(
     doc,
     "URL",
@@ -262,6 +271,12 @@ function renderSection(props: SectionProps) {
   concurrencyControl.input.min = "1";
   concurrencyControl.input.max = String(MAX_TRANSLATION_CONCURRENCY);
   concurrencyControl.input.step = "1";
+  const clearPagesControl = createLabeledInput(
+    doc,
+    "Clear Pages",
+    translationConfig.clearPages,
+    DEFAULT_TRANSLATION_CLEAR_PAGES,
+  );
   const promptControl = createLabeledTextarea(
     doc,
     "Prompt",
@@ -318,6 +333,11 @@ function renderSection(props: SectionProps) {
   translateButton.className = "show-markdown-mineru-button is-primary";
   translateButton.textContent = "Translate";
 
+  const clearButton = doc.createElement("button");
+  clearButton.type = "button";
+  clearButton.className = "show-markdown-mineru-button is-danger";
+  clearButton.textContent = "Clear Translations";
+
   const status = doc.createElement("div");
   status.className = "show-markdown-mineru-status";
   let activeTranslationStatus = "";
@@ -328,10 +348,13 @@ function renderSection(props: SectionProps) {
     const state = reader ? readerOverlayStates.get(getReaderKey(reader)) : null;
     const isVisible = Boolean(state?.visible);
     const isTranslating = Boolean(state?.translationAbortController);
+    const showOcrText = Boolean(state?.showOcrText);
     toggleButton.classList.toggle("is-active", isVisible);
     toggleButton.textContent = isVisible
       ? "Hide Bounding Boxes"
       : "Show Bounding Boxes";
+    ocrTextButton.classList.toggle("is-active", showOcrText);
+    ocrTextButton.textContent = showOcrText ? "Hide OCR Text" : "Show OCR Text";
     translateButton.classList.toggle("is-danger", isTranslating);
     translateButton.classList.toggle("is-primary", !isTranslating);
     translateButton.disabled = isStartingTranslation && !isTranslating;
@@ -340,6 +363,7 @@ function renderSection(props: SectionProps) {
       : isStartingTranslation
         ? "Starting..."
         : "Translate";
+    clearButton.disabled = isTranslating || isStartingTranslation;
     if (isTranslating && activeTranslationStatus) {
       status.textContent = activeTranslationStatus;
       return;
@@ -386,6 +410,18 @@ function renderSection(props: SectionProps) {
     }
   });
 
+  ocrTextButton.addEventListener("click", async () => {
+    ocrTextButton.disabled = true;
+    status.textContent = "Loading layout...";
+    try {
+      const result = await toggleOcrText(item);
+      status.textContent = result.message;
+    } finally {
+      ocrTextButton.disabled = false;
+      refreshButtonState(true);
+    }
+  });
+
   translateButton.addEventListener("click", async () => {
     const reader = findOpenPdfReaderForItem(item) || getActivePdfReader();
     const state = reader ? readerOverlayStates.get(getReaderKey(reader)) : null;
@@ -405,6 +441,7 @@ function renderSection(props: SectionProps) {
       pages: pagesControl.input.value,
       skipPages: skipPagesControl.input.value,
       concurrency: concurrencyControl.input.value,
+      clearPages: clearPagesControl.input.value,
       prompt: promptControl.textarea.value,
       stripStrings: stripStringsControl.input.value,
     };
@@ -434,6 +471,22 @@ function renderSection(props: SectionProps) {
     }
   });
 
+  clearButton.addEventListener("click", async () => {
+    clearButton.disabled = true;
+    status.textContent = "Clearing translations...";
+    try {
+      const result = await clearTranslations(item, clearPagesControl.input.value);
+      status.textContent = result.message;
+    } catch (err) {
+      ztoolkit.log("Show Markdown: failed to clear translations", err);
+      status.textContent =
+        err instanceof Error ? err.message : "Failed to clear translations.";
+    } finally {
+      clearButton.disabled = false;
+      refreshButtonState();
+    }
+  });
+
   promptControl.textarea.addEventListener("change", () => {
     saveTranslationConfig({
       baseURL: baseURLControl.input.value,
@@ -441,6 +494,7 @@ function renderSection(props: SectionProps) {
       pages: pagesControl.input.value,
       skipPages: skipPagesControl.input.value,
       concurrency: concurrencyControl.input.value,
+      clearPages: clearPagesControl.input.value,
       prompt: promptControl.textarea.value,
       stripStrings: stripStringsControl.input.value,
     });
@@ -452,6 +506,19 @@ function renderSection(props: SectionProps) {
       pages: pagesControl.input.value,
       skipPages: skipPagesControl.input.value,
       concurrency: concurrencyControl.input.value,
+      clearPages: clearPagesControl.input.value,
+      prompt: promptControl.textarea.value,
+      stripStrings: stripStringsControl.input.value,
+    });
+  });
+  clearPagesControl.input.addEventListener("change", () => {
+    saveTranslationConfig({
+      baseURL: baseURLControl.input.value,
+      model: modelControl.input.value,
+      pages: pagesControl.input.value,
+      skipPages: skipPagesControl.input.value,
+      concurrency: concurrencyControl.input.value,
+      clearPages: clearPagesControl.input.value,
       prompt: promptControl.textarea.value,
       stripStrings: stripStringsControl.input.value,
     });
@@ -470,7 +537,7 @@ function renderSection(props: SectionProps) {
 
   const actions = doc.createElement("div");
   actions.className = "show-markdown-mineru-actions";
-  actions.append(toggleButton, translateButton);
+  actions.append(toggleButton, ocrTextButton, translateButton);
 
   const translationGroup = createConfigGroup(doc, "Translation");
   translationGroup.append(
@@ -481,11 +548,38 @@ function renderSection(props: SectionProps) {
   );
 
   const pageGroup = createConfigGroup(doc, "Pages");
-  pageGroup.append(
+  const pageTabs = doc.createElement("div");
+  pageTabs.className = "show-markdown-mineru-tabs";
+  const translatePageTab = createTabButton(doc, "Translate");
+  const clearPageTab = createTabButton(doc, "Clear");
+  pageTabs.append(translatePageTab, clearPageTab);
+
+  const translatePagesPanel = doc.createElement("div");
+  translatePagesPanel.className = "show-markdown-mineru-tab-panel";
+  translatePagesPanel.append(
     pagesControl.wrapper,
     skipPagesControl.wrapper,
     concurrencyControl.wrapper,
   );
+
+  const clearPagesPanel = doc.createElement("div");
+  clearPagesPanel.className = "show-markdown-mineru-tab-panel";
+  clearPagesPanel.hidden = true;
+  clearPagesPanel.append(
+    clearPagesControl.wrapper,
+    clearButton,
+  );
+  const setPageTab = (tab: "translate" | "clear") => {
+    const isTranslate = tab === "translate";
+    translatePageTab.classList.toggle("is-active", isTranslate);
+    clearPageTab.classList.toggle("is-active", !isTranslate);
+    translatePagesPanel.hidden = !isTranslate;
+    clearPagesPanel.hidden = isTranslate;
+  };
+  translatePageTab.addEventListener("click", () => setPageTab("translate"));
+  clearPageTab.addEventListener("click", () => setPageTab("clear"));
+  setPageTab("translate");
+  pageGroup.append(pageTabs, translatePagesPanel, clearPagesPanel);
 
   const displayGroup = createConfigGroup(doc, "Display");
   displayGroup.append(
@@ -531,6 +625,81 @@ async function toggleBoundingBoxes(
 
   await enableBoundingBoxes(targetReader, layoutResult.layout);
   return { message: "Bounding boxes visible" };
+}
+
+async function toggleOcrText(item: Zotero.Item): Promise<{ message: string }> {
+  const readerFromItem = findOpenPdfReaderForItem(item);
+  const reader = readerFromItem || getActivePdfReader();
+  const pdfAttachment = resolvePdfAttachment(item, reader);
+  if (!pdfAttachment) return { message: "Open a PDF reader first." };
+
+  const targetReader = reader || findOpenPdfReaderForItem(pdfAttachment);
+  if (!targetReader) return { message: "Open this PDF in Zotero reader first." };
+
+  let state = readerOverlayStates.get(getReaderKey(targetReader));
+  if (!state) {
+    const layoutResult = await loadMineruLayout(pdfAttachment);
+    if (!layoutResult.layout) return { message: layoutResult.message };
+    state = await enableBoundingBoxes(targetReader, layoutResult.layout);
+  }
+
+  state.showOcrText = !state.showOcrText;
+  if (state.showOcrText) state.visible = true;
+  scheduleRender(targetReader, state);
+  return {
+    message: state.showOcrText
+      ? "OCR text visible in bounding boxes"
+      : "OCR text hidden",
+  };
+}
+
+async function clearTranslations(
+  item: Zotero.Item,
+  pageSpec: string,
+): Promise<{ message: string }> {
+  const readerFromItem = findOpenPdfReaderForItem(item);
+  const reader = readerFromItem || getActivePdfReader();
+  const pdfAttachment = resolvePdfAttachment(item, reader);
+  if (!pdfAttachment) return { message: "Open or select a PDF item first." };
+
+  const targetReader = reader || findOpenPdfReaderForItem(pdfAttachment);
+  const state = targetReader
+    ? readerOverlayStates.get(getReaderKey(targetReader))
+    : undefined;
+  if (state?.translationAbortController) {
+    return { message: "Stop translation before clearing translations." };
+  }
+
+  let layout = state?.layout;
+  if (!layout) {
+    const layoutResult = await loadMineruLayout(pdfAttachment);
+    if (!layoutResult.layout) return { message: layoutResult.message };
+    layout = layoutResult.layout;
+  }
+
+  const pageIndexes = getClearPageIndexes(layout, pageSpec);
+  if (!pageIndexes.size) {
+    return { message: "No pages selected for clearing." };
+  }
+
+  let clearedCount = 0;
+  for (const pageIndex of pageIndexes) {
+    const page = layout.pages.get(pageIndex);
+    if (!page) continue;
+    for (const box of page.boxes) {
+      if (!normalizeText(box.translation || "")) continue;
+      box.translation = "";
+      clearedCount += 1;
+    }
+  }
+
+  await saveTranslationCache(layout);
+  if (state && targetReader) scheduleRender(targetReader, state);
+
+  if (!clearedCount) return { message: "No cached translations to clear." };
+  return {
+    message: `Cleared ${clearedCount} translations from ${formatPageSelection(pageIndexes)}.`,
+  };
 }
 
 async function translateBoundingBoxes(
@@ -922,6 +1091,7 @@ async function enableBoundingBoxes(
     layout,
     cleanupCallbacks: [],
     renderTimer: null,
+    showOcrText: false,
     visible: true,
   };
   readerOverlayStates.set(getReaderKey(reader), state);
@@ -1065,6 +1235,7 @@ function renderBoundingBoxesInWindow(
         pageWidth,
         pageHeight,
         state.displayConfig,
+        state.showOcrText,
       );
       if (rectangle) layer.append(rectangle);
     }
@@ -1080,6 +1251,7 @@ function createBoundingBoxNode(
   pageWidth: number,
   pageHeight: number,
   displayConfig: DisplayConfig,
+  showOcrText: boolean,
 ) {
   const [sourceWidth, sourceHeight] = sourceSize;
   if (!sourceWidth || !sourceHeight) return null;
@@ -1106,7 +1278,11 @@ function createBoundingBoxNode(
     .filter(Boolean)
     .join("\n\n");
 
-  if (box.translation) {
+  const displayText = showOcrText
+    ? normalizeText(box.text || "")
+    : normalizeText(box.translation || "");
+
+  if (displayText) {
     rectangle.classList.add("has-translation");
     rectangle.style.background = displayConfig.translatedBoxColor;
     rectangle.style.borderColor = displayConfig.translatedBoxBorderColor;
@@ -1114,7 +1290,7 @@ function createBoundingBoxNode(
     const scroll = doc.createElement("div");
     scroll.className = BBOX_SCROLL_CLASS;
     scroll.tabIndex = 0;
-    scroll.setAttribute("aria-label", "Translation");
+    scroll.setAttribute("aria-label", showOcrText ? "OCR text" : "Translation");
     scroll.style.color = displayConfig.textColor;
     const pageScale = getPageScale(sourceSize, pageWidth, pageHeight);
     const fontSize = getTranslationFontSize(displayConfig, pageScale);
@@ -1160,7 +1336,7 @@ function createBoundingBoxNode(
     text.style.whiteSpace = "pre-wrap";
     text.style.wordBreak = "break-word";
     text.style.setProperty("-moz-user-select", "text");
-    renderTextWithMath(doc, text, box.translation);
+    renderTextWithMath(doc, text, displayText);
     scroll.append(text);
 
     installTranslatedBoxEventGuards(rectangle, scroll);
@@ -1826,6 +2002,34 @@ function getSelectedPageIndexes(
   return selected;
 }
 
+function getClearPageIndexes(
+  layout: MineruLayout,
+  pageSpec: string,
+): Set<number> {
+  const normalized = normalizeText(pageSpec).toLowerCase();
+  const pageIndexes = Array.from(layout.pages.keys()).sort((a, b) => a - b);
+  if (!normalized || normalized === "all" || normalized === "*") {
+    return new Set(pageIndexes);
+  }
+
+  const maxPageIndex = Math.max(...pageIndexes, 0);
+  const parsedPages = parsePageSpec(pageSpec, maxPageIndex);
+  if (!parsedPages) return new Set(pageIndexes);
+  for (const pageIndex of Array.from(parsedPages)) {
+    if (!layout.pages.has(pageIndex)) parsedPages.delete(pageIndex);
+  }
+  return parsedPages;
+}
+
+function formatPageSelection(pageIndexes: Set<number>): string {
+  const pages = Array.from(pageIndexes)
+    .sort((a, b) => a - b)
+    .map((pageIndex) => pageIndex + 1);
+  if (!pages.length) return "no pages";
+  if (pages.length > 5) return `${pages.length} pages`;
+  return `page${pages.length > 1 ? "s" : ""} ${pages.join(", ")}`;
+}
+
 function getTranslatableBoxes(
   layout: MineruLayout,
   selectedPageIndexes: Set<number>,
@@ -2280,6 +2484,14 @@ function createConfigGroup(doc: Document, title: string) {
   return section;
 }
 
+function createTabButton(doc: Document, label: string) {
+  const button = doc.createElement("button");
+  button.type = "button";
+  button.className = "show-markdown-mineru-tab";
+  button.textContent = label;
+  return button;
+}
+
 function createLabeledTextarea(
   doc: Document,
   labelText: string,
@@ -2317,6 +2529,10 @@ function getTranslationConfig(): TranslationConfig {
       PREF_TRANSLATION_CONCURRENCY,
       DEFAULT_TRANSLATION_CONCURRENCY,
     ),
+    clearPages: getPrefString(
+      PREF_TRANSLATION_CLEAR_PAGES,
+      DEFAULT_TRANSLATION_CLEAR_PAGES,
+    ),
     prompt: getPrefString(PREF_TRANSLATION_PROMPT, DEFAULT_TRANSLATION_PROMPT),
     stripStrings: getPrefString(
       PREF_TRANSLATION_STRIP_STRINGS,
@@ -2345,6 +2561,11 @@ function saveTranslationConfig(config: TranslationConfig) {
   Zotero.Prefs.set(
     PREF_TRANSLATION_CONCURRENCY,
     String(getTranslationConcurrency(config)),
+    true,
+  );
+  Zotero.Prefs.set(
+    PREF_TRANSLATION_CLEAR_PAGES,
+    config.clearPages.trim() || DEFAULT_TRANSLATION_CLEAR_PAGES,
     true,
   );
   Zotero.Prefs.set(
@@ -2487,7 +2708,7 @@ function injectPaneStyles(doc: Document) {
       box-sizing: border-box;
       display: flex !important;
       flex-direction: column !important;
-      gap: 8px !important;
+      gap: 7px !important;
       padding: 6px;
       position: sticky;
       top: 0;
@@ -2544,6 +2765,50 @@ function injectPaneStyles(doc: Document) {
     .show-markdown-mineru-button:disabled {
       cursor: default;
       opacity: 0.55;
+    }
+
+    .show-markdown-mineru-tabs {
+      background: rgba(127, 127, 127, 0.1);
+      border: 1px solid var(--fill-quinary, rgba(127, 127, 127, 0.25));
+      border-radius: 7px;
+      box-sizing: border-box;
+      display: flex !important;
+      gap: 4px;
+      padding: 4px;
+      width: 100%;
+    }
+
+    .show-markdown-mineru-tab {
+      appearance: none;
+      background: transparent;
+      border: 1px solid transparent;
+      border-radius: 5px;
+      box-sizing: border-box;
+      color: inherit;
+      cursor: pointer;
+      flex: 1 1 0;
+      font: menu;
+      font-weight: 600;
+      min-height: 28px;
+      min-width: 0;
+      padding: 4px 8px;
+      text-align: center;
+    }
+
+    .show-markdown-mineru-tab.is-active {
+      background: rgba(80, 145, 255, 0.24);
+      border-color: rgba(80, 145, 255, 0.5);
+    }
+
+    .show-markdown-mineru-tab-panel {
+      display: flex !important;
+      flex-direction: column !important;
+      gap: 9px !important;
+      width: 100%;
+    }
+
+    .show-markdown-mineru-tab-panel[hidden] {
+      display: none !important;
     }
 
     .show-markdown-mineru-config-group {

@@ -1,12 +1,13 @@
 import { config } from "../../../package.json";
 import {
   ensureNamedMineruMarkdownFile,
+  findCachedMineruMarkdownPaths,
+  getFileNameFromPath,
   isMineruCachePath,
-  isMineruMarkdownPathForAttachment,
 } from "./cache";
 
-const MARKDOWN_ATTACHMENT_TITLE = "Markdown";
 const MARKDOWN_CONTENT_TYPE = "text/markdown";
+const MARKDOWN_FILE_EXTENSION_RE = /\.(?:md|markdown)$/i;
 const MARKDOWN_RETRY_DELAYS_MS = [
   1_000, 2_500, 5_000, 10_000, 20_000, 30_000, 60_000, 120_000, 300_000,
   300_000, 300_000, 300_000,
@@ -193,34 +194,36 @@ export async function ensureMarkdownAttachmentForPdf(
     const parentItem = Zotero.Items.get(parentId);
     if (!isRegularItem(parentItem)) return;
 
-    const markdownPath = await ensureNamedMineruMarkdownFile(
-      pdfAttachment.id,
-      String(parentItem.getField?.("title") || "Untitled"),
-    );
-    if (!markdownPath) {
+    const itemTitle = String(parentItem.getField?.("title") || "Untitled");
+    await ensureNamedMineruMarkdownFile(pdfAttachment.id, itemTitle);
+    const markdownPaths = await findCachedMineruMarkdownPaths(pdfAttachment.id);
+    if (!markdownPaths.length) {
       scheduleMarkdownRetry(pdfAttachment.id, options);
       return;
     }
 
-    const existing = await findExistingMarkdownAttachment(
-      parentItem,
-      pdfAttachment.id,
-      markdownPath,
-    );
-    if (existing) {
-      await normalizeMarkdownAttachment(existing);
-      clearMarkdownRetryTimer(pdfAttachment.id);
-      return;
-    }
+    const existingAttachments =
+      await findExistingMarkdownAttachments(parentItem);
 
-    const linkedAttachment = await Zotero.Attachments.linkFromFile({
-      file: markdownPath,
-      parentItemID: parentItem.id,
-      title: MARKDOWN_ATTACHMENT_TITLE,
-      contentType: MARKDOWN_CONTENT_TYPE,
-      charset: "utf-8",
-    });
-    await normalizeMarkdownAttachment(linkedAttachment);
+    await Promise.all(
+      markdownPaths.map(async (markdownPath) => {
+        const title = getFileNameFromPath(markdownPath);
+        const existing = existingAttachments.get(normalizePath(markdownPath));
+        if (existing) {
+          await normalizeMarkdownAttachment(existing, title);
+          return;
+        }
+
+        const linkedAttachment = await Zotero.Attachments.linkFromFile({
+          file: markdownPath,
+          parentItemID: parentItem.id,
+          title,
+          contentType: MARKDOWN_CONTENT_TYPE,
+          charset: "utf-8",
+        });
+        await normalizeMarkdownAttachment(linkedAttachment, title);
+      }),
+    );
     clearMarkdownRetryTimer(pdfAttachment.id);
   } catch (err) {
     ztoolkit.log("Show Markdown: failed to create Markdown attachment", err);
@@ -272,12 +275,10 @@ function clearMarkdownRetryTimers() {
   markdownRetryTimers.clear();
 }
 
-async function findExistingMarkdownAttachment(
+async function findExistingMarkdownAttachments(
   parentItem: Zotero.Item,
-  pdfAttachmentId: number,
-  markdownPath: string,
-): Promise<Zotero.Item | null> {
-  const targetPath = normalizePath(markdownPath);
+): Promise<Map<string, Zotero.Item>> {
+  const attachments = new Map<string, Zotero.Item>();
   const attachmentIds = parentItem.getAttachments?.() || [];
 
   for (const attachmentId of attachmentIds) {
@@ -291,37 +292,30 @@ async function findExistingMarkdownAttachment(
     if (!attachment?.isAttachment?.()) continue;
     if (isPdfAttachment(attachment as Zotero.Item)) continue;
 
-    const currentTitle = String(attachment.getField?.("title") || "");
     const attachmentPath = await getAttachmentPath(attachment as Zotero.Item);
-    if (
-      currentTitle !== MARKDOWN_ATTACHMENT_TITLE ||
-      !attachmentPath ||
-      !isMineruCachePath(attachmentPath)
-    ) {
+    if (!attachmentPath || !isMineruCachePath(attachmentPath)) continue;
+    if (!isMarkdownAttachment(attachment as Zotero.Item, attachmentPath)) {
       continue;
     }
 
-    if (normalizePath(attachmentPath) === targetPath)
-      return attachment as Zotero.Item;
-
-    if (isMineruMarkdownPathForAttachment(pdfAttachmentId, attachmentPath)) {
-      attachment.setDeleted?.(true);
-      await attachment.saveTx?.();
-    }
+    attachments.set(normalizePath(attachmentPath), attachment as Zotero.Item);
   }
 
-  return null;
+  return attachments;
 }
 
-async function normalizeMarkdownAttachment(attachment: Zotero.Item) {
+async function normalizeMarkdownAttachment(
+  attachment: Zotero.Item,
+  title: string,
+) {
   const currentTitle = String(attachment.getField?.("title") || "");
   const mutable = attachment as Zotero.Item & {
     attachmentContentType?: string;
   };
 
   let changed = false;
-  if (currentTitle !== MARKDOWN_ATTACHMENT_TITLE) {
-    attachment.setField?.("title", MARKDOWN_ATTACHMENT_TITLE);
+  if (currentTitle !== title) {
+    attachment.setField?.("title", title);
     changed = true;
   }
   if (mutable.attachmentContentType !== MARKDOWN_CONTENT_TYPE) {
@@ -347,6 +341,22 @@ async function getAttachmentPath(
   if (typeof syncPath === "string" && syncPath) return syncPath;
 
   return withPath.attachmentPath || null;
+}
+
+function isMarkdownAttachment(item: Zotero.Item, filePath?: string): boolean {
+  const attachment = item as Zotero.Item & {
+    attachmentContentType?: string;
+    attachmentFilename?: string;
+  };
+  const contentType = attachment.attachmentContentType?.toLowerCase();
+  if (
+    contentType === MARKDOWN_CONTENT_TYPE ||
+    contentType === "text/x-markdown"
+  )
+    return true;
+
+  const fileName = attachment.attachmentFilename || filePath || "";
+  return MARKDOWN_FILE_EXTENSION_RE.test(fileName);
 }
 
 function normalizePath(path: string): string {

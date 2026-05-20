@@ -1,9 +1,12 @@
 const MINERU_CACHE_DIR_NAME = "llm-for-zotero-mineru";
 
 const MAX_FILE_NAME_LENGTH = 180;
+const MARKDOWN_FILE_EXTENSION_RE = /\.(?:md|markdown)$/i;
+const EXCLUDED_MARKDOWN_FILE_NAMES = new Set(["full.md"]);
 
 type IOUtilsLike = {
   exists?: (path: string) => Promise<boolean>;
+  getChildren?: (path: string) => Promise<string[]>;
   makeDirectory?: (
     path: string,
     options?: { createAncestors?: boolean; ignoreExisting?: boolean },
@@ -20,6 +23,11 @@ type OSFileLike = {
   ) => Promise<void>;
   read?: (path: string) => Promise<Uint8Array | ArrayBuffer>;
   writeAtomic?: (path: string, data: Uint8Array) => Promise<void>;
+  DirectoryIterator?: DirectoryIteratorConstructable;
+};
+
+type FileConstructor = {
+  new (path?: string): nsIFile;
 };
 
 function getIOUtils(): IOUtilsLike | undefined {
@@ -208,6 +216,18 @@ export async function findCachedMineruMarkdownPath(
   return null;
 }
 
+export async function findCachedMineruMarkdownPaths(
+  pdfAttachmentId: number,
+): Promise<string[]> {
+  const itemDir = getMineruItemDir(pdfAttachmentId);
+  const children = await getDirectoryChildren(itemDir);
+  return children
+    .filter((path) => isDisplayedMarkdownPath(path) && isRegularFile(path))
+    .sort((a, b) =>
+      getFileNameFromPath(a).localeCompare(getFileNameFromPath(b)),
+    );
+}
+
 export async function findCachedMineruLayoutPath(
   pdfAttachmentId: number,
   itemTitle: string,
@@ -252,6 +272,13 @@ export async function ensureNamedMineruMarkdownFile(
   return targetPath;
 }
 
+export function getFileNameFromPath(path: string): string {
+  const normalizedPath = normalizePath(path);
+  const separatorIndex = normalizedPath.lastIndexOf("/");
+  if (separatorIndex < 0) return normalizedPath;
+  return normalizedPath.slice(separatorIndex + 1);
+}
+
 function getNamedMarkdownPath(attachmentId: number, itemTitle: string): string {
   return joinLocalPath(
     getMineruItemDir(attachmentId),
@@ -283,4 +310,82 @@ function sanitizeFileName(value: string): string {
 
 function normalizePath(path: string): string {
   return path.replace(/\\/g, "/").replace(/\/+/g, "/");
+}
+
+async function getDirectoryChildren(path: string): Promise<string[]> {
+  if (!(await pathExists(path))) return [];
+
+  const io = getIOUtils();
+  if (io?.getChildren) {
+    try {
+      return await io.getChildren(path);
+    } catch {
+      return [];
+    }
+  }
+
+  const osFile = getOSFile();
+  if (osFile?.DirectoryIterator) {
+    const iterator = new osFile.DirectoryIterator(path);
+    const children: string[] = [];
+    try {
+      await iterator.forEach((entry: OS.File.Entry) => {
+        if (!entry.isDir) children.push(entry.path);
+      });
+    } catch {
+      return [];
+    } finally {
+      iterator.close();
+    }
+    return children;
+  }
+
+  return getDirectoryChildrenFromLocalFile(path);
+}
+
+function getDirectoryChildrenFromLocalFile(path: string): string[] {
+  try {
+    const directory = createLocalFile(path);
+    if (!directory.exists() || !directory.isDirectory()) return [];
+
+    const entries = directory.directoryEntries;
+    const children: string[] = [];
+    try {
+      while (entries.hasMoreElements()) {
+        const entry = entries.nextFile;
+        if (entry?.isFile()) children.push(entry.path);
+      }
+    } finally {
+      entries.close();
+    }
+    return children;
+  } catch {
+    return [];
+  }
+}
+
+function isDisplayedMarkdownPath(path: string): boolean {
+  const fileName = getFileNameFromPath(path).toLowerCase();
+  return (
+    MARKDOWN_FILE_EXTENSION_RE.test(fileName) &&
+    !EXCLUDED_MARKDOWN_FILE_NAMES.has(fileName)
+  );
+}
+
+function isRegularFile(path: string): boolean {
+  try {
+    const file = createLocalFile(path);
+    return file.exists() && file.isFile();
+  } catch {
+    return true;
+  }
+}
+
+function createLocalFile(path: string): nsIFile {
+  const File = Components.Constructor(
+    "@mozilla.org/file/local;1",
+    "nsIFile",
+    "initWithPath",
+  ) as FileConstructor;
+  return new File(path);
 }

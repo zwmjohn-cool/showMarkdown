@@ -7,7 +7,8 @@ Show Markdown 是一个 Zotero 插件，用来配合 MinerU 的 OCR/PDF 解析�
 - 从 MinerU 缓存目录读取 Markdown，并在 Zotero 条目中生成/显示对应的 Markdown 附件。
 - 在 Zotero PDF 阅读器右侧栏提供 `MinerU` 工具入口。
 - 读取 MinerU 结果目录中的 `layout.json`，在 PDF 页面上绘制 bounding box。
-- `Toggle` 按钮控制 bounding box 显示/隐藏。
+- `Show Bounding Boxes` / `Hide Bounding Boxes` 控制 bounding box 显示/隐藏。
+- `Show OCR Text` / `Hide OCR Text` 控制是否在 bounding box 内显示原始 OCR 文本。
 - 使用本地 OpenAI-compatible 大模型接口翻译 OCR 文本。
 - 翻译配置支持：
   - URL
@@ -16,8 +17,10 @@ Show Markdown 是一个 Zotero 插件，用来配合 MinerU 的 OCR/PDF 解析�
   - 要从翻译结果中删除的字符串
   - 翻译页码范围
   - 跳过页码范围
+  - 清空翻译的页码范围
   - 并行数
-- `Translate` 按钮开始翻译，`Stop` 按钮终止当前翻译任务。
+- `Translate` 按钮开始翻译，翻译中会变成 `Stop Translation`。
+- `Clear Translations` 支持清空全部翻译或指定页码翻译缓存。
 - 翻译结果会保存到 MinerU 结果目录中的 `show-markdown-translations.json`，下次打开会自动复用。
 - 翻译完成一个 bounding box 后会立即显示到对应框内。
 - 有翻译文字的框支持：

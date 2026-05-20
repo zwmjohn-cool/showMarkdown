@@ -15,6 +15,7 @@ type FileConstructor = {
 
 const QUICK_LOOK_EXECUTABLE = "/usr/bin/qlmanage";
 const QUICK_LOOK_KILL_EXECUTABLE = "/usr/bin/pkill";
+const MARKDOWN_FILE_EXTENSION_RE = /\.(?:md|markdown)$/i;
 const quickLookListeners = new WeakMap<Window, QuickLookHandle>();
 const quickLookWindows = new Set<Window>();
 const handledSpaceEvents = new WeakSet<KeyboardEvent>();
@@ -83,13 +84,13 @@ function shouldHandleSpace(
 }
 
 async function toggleQuickLookForSelection(win: _ZoteroTypes.MainWindow) {
-  const pdfAttachment = await resolveSelectedPdfAttachment(win);
-  if (!pdfAttachment) {
+  const attachment = await resolveSelectedQuickLookAttachment(win);
+  if (!attachment) {
     if (quickLookFilePath) closeQuickLook();
     return;
   }
 
-  const filePath = await getAttachmentPath(pdfAttachment);
+  const filePath = await getAttachmentPath(attachment);
   if (!filePath) return;
 
   if (isQuickLookOpenFor(filePath)) {
@@ -101,32 +102,38 @@ async function toggleQuickLookForSelection(win: _ZoteroTypes.MainWindow) {
   openQuickLook(filePath);
 }
 
-async function resolveSelectedPdfAttachment(
+async function resolveSelectedQuickLookAttachment(
   win: _ZoteroTypes.MainWindow,
 ): Promise<Zotero.Item | null> {
   const selectedItems = getSelectedItems(win);
   if (selectedItems.length !== 1) return null;
 
   const item = selectedItems[0];
-  if (isPdfAttachment(item)) return item;
+  if (isPreviewableAttachment(item)) return item;
   if (!isRegularItem(item)) return null;
 
   const bestAttachment = await item.getBestAttachment?.();
-  if (bestAttachment && isPdfAttachment(bestAttachment)) return bestAttachment;
+  if (bestAttachment && isPreviewableAttachment(bestAttachment)) {
+    return bestAttachment;
+  }
 
   const bestAttachments = await item.getBestAttachments?.();
-  const bestPdfAttachment = bestAttachments?.find((attachment: Zotero.Item) =>
-    isPdfAttachment(attachment),
+  const bestPreviewableAttachment = bestAttachments?.find(
+    (attachment: Zotero.Item) => isPreviewableAttachment(attachment),
   );
-  if (bestPdfAttachment) return bestPdfAttachment;
+  if (bestPreviewableAttachment) return bestPreviewableAttachment;
 
   const attachmentIds = item.getAttachments?.() || [];
+  let fallbackMarkdownAttachment: Zotero.Item | null = null;
   for (const attachmentId of attachmentIds) {
     const attachment = Zotero.Items.get(attachmentId);
     if (isPdfAttachment(attachment)) return attachment;
+    if (!fallbackMarkdownAttachment && isMarkdownAttachment(attachment)) {
+      fallbackMarkdownAttachment = attachment;
+    }
   }
 
-  return null;
+  return fallbackMarkdownAttachment;
 }
 
 function getSelectedItems(win: _ZoteroTypes.MainWindow): Zotero.Item[] {
@@ -152,6 +159,32 @@ function isPdfAttachment(
   if (attachment.isPDFAttachment?.()) return true;
   if (attachment.attachmentContentType === "application/pdf") return true;
   return Boolean(attachment.attachmentFilename?.toLowerCase().endsWith(".pdf"));
+}
+
+function isPreviewableAttachment(
+  item: Zotero.Item | false | null | undefined,
+): boolean {
+  return isPdfAttachment(item) || isMarkdownAttachment(item);
+}
+
+function isMarkdownAttachment(
+  item: Zotero.Item | false | null | undefined,
+): item is Zotero.Item {
+  if (!item || !item.isAttachment?.()) return false;
+  const attachment = item as Zotero.Item & {
+    attachmentContentType?: string;
+    attachmentFilename?: string;
+    getField?: (field: string) => unknown;
+  };
+  const contentType = attachment.attachmentContentType?.toLowerCase();
+  if (contentType === "text/markdown" || contentType === "text/x-markdown") {
+    return true;
+  }
+
+  const fileName =
+    attachment.attachmentFilename ||
+    String(attachment.getField?.("title") || "");
+  return MARKDOWN_FILE_EXTENSION_RE.test(fileName);
 }
 
 async function getAttachmentPath(
@@ -276,8 +309,7 @@ function shouldIgnoreTarget(target: EventTarget | null): boolean {
 
   const role = element.getAttribute?.("role");
   if (role === "textbox" || role === "searchbox") return true;
-  if (role === "button" || role === "checkbox" || role === "radio")
-    return true;
+  if (role === "button" || role === "checkbox" || role === "radio") return true;
 
   return false;
 }
