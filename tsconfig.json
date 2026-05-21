@@ -1,5 +1,8 @@
 {
   "extends": "zotero-types/entries/sandbox/",
+  "compilerOptions": {
+    "tsBuildInfoFile": ".scaffold/tsconfig.tsbuildinfo"
+  },
   "include": ["src", "typings"],
   "exclude": ["build", "addon"]
 }

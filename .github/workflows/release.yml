@@ -24,26 +24,55 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          package_version="$(node -p "require('./package.json').version")"
+          if [ "${GITHUB_REF_NAME}" != "v${package_version}" ]; then
+            echo "::error::Release tag ${GITHUB_REF_NAME} does not match package version v${package_version}."
+            exit 1
+          fi
+
       - name: Install dependencies
         run: npm ci
 
       - name: Build plugin
         run: npm run build
 
-      - name: Prepare release artifact
+      - name: Prepare release artifacts
         run: |
+          package_version="$(node -p "require('./package.json').version")"
+          if [[ "${package_version}" == *-* ]]; then
+            update_manifest="update-beta.json"
+          else
+            update_manifest="update.json"
+          fi
+
           mkdir -p dist
-          cp .scaffold/build/show-markdown.xpi "dist/show-markdown-${GITHUB_REF_NAME}.xpi"
+          cp .scaffold/build/show-markdown.xpi dist/show-markdown.xpi
+          cp .scaffold/build/show-markdown.xpi "dist/show-markdown-v${package_version}.xpi"
+          cp ".scaffold/build/${update_manifest}" "dist/${update_manifest}"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: show-markdown-xpi
-          path: dist/*.xpi
+          name: show-markdown-release
+          path: dist/*
 
-      - name: Upload XPI to GitHub Release
+      - name: Upload XPI to versioned GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.xpi
+          files: |
+            dist/show-markdown.xpi
+            dist/show-markdown-${{ github.ref_name }}.xpi
+            dist/*.json
           generate_release_notes: true
+
+      - name: Upload update channel assets
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view release >/dev/null 2>&1 || gh release create release --title "Zotero update channel" --notes "Latest Zotero update manifest."
+          gh release upload release dist/show-markdown.xpi dist/*.json --clobber

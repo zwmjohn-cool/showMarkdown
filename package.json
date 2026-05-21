@@ -13,9 +13,9 @@
   "author": "zwm",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zwm/show-markdown.git"
+    "url": "git+https://github.com/zwmjohn-cool/showMarkdown.git"
   },
-  "homepage": "https://github.com/zwm/show-markdown#readme",
+  "homepage": "https://github.com/zwmjohn-cool/showMarkdown#readme",
   "license": "AGPL-3.0-or-later",
   "scripts": {
     "start": "zotero-plugin serve",
