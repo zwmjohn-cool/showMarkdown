@@ -2,6 +2,10 @@
 
 Show Markdown 是一个 Zotero 插件，用来配合 MinerU 的 OCR/PDF 解析结果使用。它可以把 MinerU 生成的 Markdown 加到 Zotero 条目里，也可以在 Zotero PDF 阅读器中显示 MinerU 的版面框和翻译结果。
 
+## 展示
+
+![Show Markdown 插件展示](docs/images/show-markdown-preview.jpg)
+
 ## 主要功能
 
 - 从 MinerU 缓存目录读取 Markdown，并在 Zotero 条目中生成/显示对应的 Markdown 附件。
