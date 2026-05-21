@@ -1,7 +1,7 @@
 {
   "name": "show-markdown",
   "type": "module",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Create Zotero Markdown attachments for MinerU cache files",
   "config": {
     "addonName": "Show Markdown",
